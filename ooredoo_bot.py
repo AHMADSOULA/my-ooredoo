@@ -19,29 +19,19 @@ SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
 DASHBOARD_URL = "https://my.ooredoo.dz/dashboard/my-ooredoo"
 STATE_FILE = Path("state.json")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ooredoo")
 
-# ---------- حالة انتظار الإدخال ----------
-WAITING = {
-    "username": None,     # asyncio.Future
-    "password": None,
-}
+WAITING = {"username": None, "password": None}
 
 
-# ---------------- إشعارات ----------------
 async def notify(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID, text=msg,
-            parse_mode="HTML", disable_web_page_preview=True,
-        )
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg,
+                               parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         log.error("Telegram error: %s", e)
 
@@ -52,9 +42,7 @@ async def send_photo(path: str, caption: str = ""):
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         with open(path, "rb") as f:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID, photo=f, caption=caption[:1024],
-            )
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=f, caption=caption[:1024])
     except Exception as e:
         log.error("Telegram photo error: %s", e)
 
@@ -65,15 +53,13 @@ async def send_document(path: str, filename: str, caption: str = ""):
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         with open(path, "rb") as f:
-            await bot.send_document(
-                chat_id=TELEGRAM_CHAT_ID, document=f,
-                filename=filename, caption=caption[:1024],
-            )
+            await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=f,
+                                    filename=filename, caption=caption[:1024])
     except Exception as e:
         log.error("Telegram document error: %s", e)
 
 
-# ---------------- Telegram listener ----------------
+# ---------- Telegram handlers ----------
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != TELEGRAM_CHAT_ID:
         return
@@ -88,18 +74,14 @@ async def check_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """يستقبل الرسائل منك ويعبّي الـ future المناسب"""
     if update.effective_chat.id != TELEGRAM_CHAT_ID:
         return
     if not update.message or not update.message.text:
         return
-
     text = update.message.text.strip()
 
-    # إذا كاين انتظار لاسم المستخدم
     if WAITING["username"] and not WAITING["username"].done():
         WAITING["username"].set_result(text)
-        # نحذف الرسالة من الشات للأمان (اختياري)
         try:
             await update.message.delete()
         except Exception:
@@ -107,7 +89,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ توصلت باسم المستخدم. أرسل الآن كلمة السر.")
         return
 
-    # إذا كاين انتظار لكلمة السر
     if WAITING["password"] and not WAITING["password"].done():
         WAITING["password"].set_result(text)
         try:
@@ -117,21 +98,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ توصلت بكلمة السر. جاري تسجيل الدخول...")
         return
 
-    # رسائل أخرى
     await update.message.reply_text("ℹ️ اكتب /check لجلب الرصيد.")
 
 
 async def ask_username() -> str:
-    """يبعتلك طلب اسم المستخدم ويستنى ردّك"""
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
     WAITING["username"] = fut
     await notify("📱 أرسل <b>اسم المستخدم</b> (Nom d'utilisateur):")
     try:
-        result = await asyncio.wait_for(fut, timeout=300)  # 5 دقائق
+        result = await asyncio.wait_for(fut, timeout=300)
     except asyncio.TimeoutError:
         WAITING["username"] = None
-        raise Exception("انتهت المدة (5 دقائق) بلا رد")
+        raise Exception("انتهت المدة بلا رد")
     WAITING["username"] = None
     return result
 
@@ -145,12 +124,12 @@ async def ask_password() -> str:
         result = await asyncio.wait_for(fut, timeout=300)
     except asyncio.TimeoutError:
         WAITING["password"] = None
-        raise Exception("انتهت المدة (5 دقائق) بلا رد")
+        raise Exception("انتهت المدة بلا رد")
     WAITING["password"] = None
     return result
 
 
-# ---------------- Captcha ----------------
+# ---------- Captcha ----------
 async def detect_captcha(page) -> str | None:
     checks = {
         "recaptcha_v2": "iframe[src*='google.com/recaptcha/api2/anchor']",
@@ -160,7 +139,6 @@ async def detect_captcha(page) -> str | None:
     for name, sel in checks.items():
         try:
             if await page.locator(sel).count() > 0:
-                # نتأكدو بلي ماشي invisible
                 loc = page.locator(sel).first
                 box = await loc.bounding_box()
                 if box and box["width"] > 0 and box["height"] > 0:
@@ -170,7 +148,7 @@ async def detect_captcha(page) -> str | None:
     return None
 
 
-# ---------------- Extraction ----------------
+# ---------- Balance ----------
 async def extract_balance(page) -> str | None:
     try:
         body = await page.inner_text("body")
@@ -203,10 +181,8 @@ async def extract_balance(page) -> str | None:
 
 
 async def is_logged_in(page) -> bool:
-    """نتحققو فعلياً: واش مازال في /sign-in؟"""
     try:
         if "/sign-in" in page.url or "/login" in page.url:
-            # نتحققو إذا حقل كلمة السر ما زال ظاهر
             if await page.locator("input[type='password']").count() > 0:
                 return False
     except Exception:
@@ -214,116 +190,174 @@ async def is_logged_in(page) -> bool:
     return True
 
 
-# ---------------- Main flow ----------------
+# ---------- username filling ----------
+async def fill_username(page, username: str) -> bool:
+    """3 محاولات: label → iteration على inputs → JS"""
+
+    # 1) عن طريق label "Nom d'utilisateur"
+    try:
+        xp = ("xpath=//label[contains(., \"Nom d'utilisateur\")]"
+              "/following::input[1]")
+        inp = page.locator(xp).first
+        if await inp.count() > 0:
+            await inp.click()
+            await inp.fill("")
+            await inp.type(username, delay=40)
+            log.info("Username filled via label XPath")
+            return True
+    except Exception as e:
+        log.warning("label strategy failed: %s", e)
+
+    # 2) iteration على كل الـ inputs المرئية
+    try:
+        all_inputs = page.locator("input:visible")
+        count = await all_inputs.count()
+        log.info("Visible inputs: %d", count)
+
+        for i in range(count):
+            inp = all_inputs.nth(i)
+            t = await inp.get_attribute("type") or "text"
+            ph = (await inp.get_attribute("placeholder") or "").lower()
+            name = (await inp.get_attribute("name") or "").lower()
+
+            log.info("input[%d] type=%s ph=%s name=%s", i, t, ph, name)
+
+            if t == "password" or t in ("hidden", "submit", "button", "checkbox", "radio"):
+                continue
+            if any(x in ph for x in ("search", "recherche", "téléphone", "phone")):
+                continue
+
+            await inp.click()
+            await inp.fill("")
+            await inp.type(username, delay=40)
+            log.info("Username filled via input[%d]", i)
+            return True
+    except Exception as e:
+        log.warning("input iteration failed: %s", e)
+
+    # 3) JS احتياطي
+    try:
+        ok = await page.evaluate(
+            """
+            (val) => {
+                const inputs = [...document.querySelectorAll('input')].filter(i => {
+                    const t = i.type || 'text';
+                    const st = getComputedStyle(i);
+                    return t !== 'password' && t !== 'hidden' &&
+                           st.display !== 'none' && st.visibility !== 'hidden' &&
+                           i.offsetParent !== null;
+                });
+                if (!inputs.length) return false;
+                const inp = inputs[0];
+                inp.focus();
+                inp.value = val;
+                inp.dispatchEvent(new Event('input', {bubbles: true}));
+                inp.dispatchEvent(new Event('change', {bubbles: true}));
+                return true;
+            }
+            """,
+            username,
+        )
+        if ok:
+            log.info("Username filled via JS")
+            return True
+    except Exception as e:
+        log.warning("JS fill failed: %s", e)
+
+    return False
+
+
+# ---------- main flow ----------
 async def login_and_get_balance(browser) -> str | None:
-    # 1) الجلسة المحفوظة؟
+    # session saved?
     if STATE_FILE.exists():
         log.info("Trying saved session")
-        context = await browser.new_context(
+        ctx = await browser.new_context(
             storage_state=str(STATE_FILE),
             locale="fr-FR",
             viewport={"width": 412, "height": 915},
         )
-        page = await context.new_page()
+        page = await ctx.new_page()
         try:
             await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=45000)
             await page.wait_for_timeout(4000)
             if await is_logged_in(page):
-                log.info("Saved session valid")
+                log.info("Session valid")
                 balance = await extract_balance(page)
                 if balance:
                     await notify(f"💰 <b>الرصيد:</b> {balance} دج")
-                    await context.close()
+                    await ctx.close()
                     return balance
-                # إذا الجلسة صالحة لكن ما لقيناش الرصيد، نكملو في الصفحة
-                await context.close()
-                # نكملو عادي
-            else:
-                log.info("Saved session expired")
-                await context.close()
+            await ctx.close()
         except Exception as e:
-            log.warning("Saved session attempt failed: %s", e)
+            log.warning("saved session failed: %s", e)
             try:
-                await context.close()
+                await ctx.close()
             except Exception:
                 pass
 
-    # 2) جلسة جديدة
-    context = await browser.new_context(
+    # جلسة جديدة
+    ctx = await browser.new_context(
         locale="fr-FR",
         viewport={"width": 412, "height": 915},
         user_agent=("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"),
     )
-    page = await context.new_page()
+    page = await ctx.new_page()
 
     try:
-        # 3) نروحو لـ /sign-in
-        log.info("Opening /sign-in")
+        log.info("Opening %s", SIGNIN_URL)
         await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(5000)
 
-        # كابتشا؟
+        # ننتظرو input يظهر
+        try:
+            await page.wait_for_selector("input", timeout=15000)
+        except Exception:
+            pass
+
         captcha = await detect_captcha(page)
         if captcha:
             await page.screenshot(path="captcha.png", full_page=True)
             await send_photo("captcha.png", f"⚠️ كاين كابتشا: {captcha}")
-            await notify("⛔ ما نقدرش نكمل. نحتاجو أداة حل كابتشا.")
-            await context.close()
+            await notify("⛔ نحتاجو حل كابتشا باش نكملو.")
+            await ctx.close()
             return None
 
-        # 4) نطلب من المستخدم البيانات
+        # نأخذو البيانات من المستخدم
         username = await ask_username()
         password = await ask_password()
 
-        # 5) نعبّيو الحقول — نلقاوهم واحد واحد
+        # ---- تعبئة اسم المستخدم ----
         await page.wait_for_timeout(500)
-
-        # --- اسم المستخدم ---
-        user_selectors = [
-            "input[placeholder*='utilisateur' i]",
-            "input[placeholder*='Nom' i]",
-            "input[name*='user' i]",
-            "input[id*='user' i]",
-            "input[type='text']",
-            "input[type='email']",
-        ]
-        user_filled = False
-        for sel in user_selectors:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() > 0:
-                    await loc.click()
-                    await loc.fill("")  # نمسحو أي شي
-                    await loc.type(username, delay=30)
-                    log.info("Username filled with: %s", sel)
-                    user_filled = True
-                    break
-            except Exception as e:
-                log.warning("username selector %s failed: %s", sel, e)
-                continue
-
-        if not user_filled:
+        ok_user = await fill_username(page, username)
+        if not ok_user:
             await page.screenshot(path="no_user_field.png", full_page=True)
             await send_photo("no_user_field.png", "❌ ما لقيتش حقل اسم المستخدم")
-            raise Exception("ما لقيتش حقل اسم المستخدم")
+            await ctx.close()
+            return None
 
-        # --- كلمة السر ---
-        pwd_sel = "input[type='password']"
-        await page.wait_for_selector(pwd_sel, timeout=10000)
-        pwd_loc = page.locator(pwd_sel).first
-        await pwd_loc.click()
-        await pwd_loc.fill("")
-        await pwd_loc.type(password, delay=30)
-        log.info("Password filled")
+        # ---- تعبئة كلمة السر ----
+        try:
+            pwd_sel = "input[type='password']"
+            await page.wait_for_selector(pwd_sel, timeout=10000)
+            pwd = page.locator(pwd_sel).first
+            await pwd.click()
+            await pwd.fill("")
+            await pwd.type(password, delay=40)
+            log.info("Password filled")
+        except Exception as e:
+            await page.screenshot(path="no_pwd_field.png", full_page=True)
+            await send_photo("no_pwd_field.png", "❌ ما لقيتش حقل كلمة السر")
+            await notify(f"❌ خطأ: <code>{e}</code>")
+            await ctx.close()
+            return None
 
-        # 6) نأكدو بلي الحقول معبّيين
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(1200)
         await page.screenshot(path="filled.png", full_page=True)
-        await send_photo("filled.png", "📸 الصفحة بعد التعبئة — نتحققو")
+        await send_photo("filled.png", "📸 الصفحة بعد التعبئة")
 
-        # 7) نضغطو Connexion — نستعملو JS باش نضغطو حتى لو disabled
-        clicked = False
+        # ---- نضغطو Connexion ----
         try:
             btn = page.locator(
                 "button:has-text('Connexion'), "
@@ -332,96 +366,80 @@ async def login_and_get_balance(browser) -> str | None:
             ).first
             if await btn.count() > 0:
                 # نستنى يكون enabled
-                for _ in range(20):
-                    is_disabled = await btn.get_attribute("disabled")
-                    if is_disabled is None:
+                for _ in range(30):
+                    d = await btn.get_attribute("disabled")
+                    if d is None:
                         break
                     await page.wait_for_timeout(300)
                 await btn.click()
-                clicked = True
-                log.info("Clicked Connexion button")
+                log.info("Clicked Connexion")
         except Exception as e:
-            log.warning("Btn click failed: %s", e)
-
-        if not clicked:
-            # نحاول JS
+            log.warning("Click failed: %s", e)
             try:
                 await page.evaluate("""
                     () => {
-                        const btns = document.querySelectorAll('button');
-                        for (const b of btns) {
-                            if (/connexion|connecter/i.test(b.textContent||'')) {
-                                b.removeAttribute('disabled');
-                                b.click();
-                                return true;
-                            }
-                        }
-                        return false;
+                        const b = [...document.querySelectorAll('button')]
+                            .find(x => /connexion|connecter/i.test(x.textContent||''));
+                        if (b) { b.removeAttribute('disabled'); b.click(); }
                     }
                 """)
-                log.info("Clicked Connexion via JS")
-            except Exception as e:
-                log.error("JS click failed: %s", e)
+                log.info("Clicked via JS")
+            except Exception as e2:
+                log.error("JS click failed: %s", e2)
 
-        # 8) ننتظرو
-        await page.wait_for_timeout(6000)
+        # ---- ننتظرو ----
+        await page.wait_for_timeout(7000)
         try:
             await page.wait_for_load_state("networkidle", timeout=30000)
         except Exception:
             pass
 
-        # 9) واش دخلنا؟
+        # ---- دخلنا؟ ----
         if not await is_logged_in(page):
             await page.screenshot(path="login_failed.png", full_page=True)
             await send_photo("login_failed.png", "❌ ما دخلناش")
-            await notify(f"❌ URL الحالي: <code>{page.url}</code>")
-            await context.close()
+            await notify(f"🔗 URL: <code>{page.url}</code>")
+            await ctx.close()
             return None
 
-        # 10) نحفظو الجلسة
-        await context.storage_state(path=str(STATE_FILE))
+        # ---- نحفظو الجلسة ----
+        await ctx.storage_state(path=str(STATE_FILE))
         log.info("Session saved")
 
-        # 11) نروحو لصفحة الرصيد
+        # ---- صفحة الرصيد ----
         await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(6000)
+        await page.wait_for_timeout(7000)
 
-        # 12) نستخرجو الرصيد
         balance = await extract_balance(page)
-
         if balance:
             await notify(f"💰 <b>الرصيد:</b> {balance} دج")
-            await context.close()
+            await ctx.close()
             return balance
         else:
             await page.screenshot(path="no_balance.png", full_page=True)
             await send_photo("no_balance.png", "📸 dashboard — ما لقيتش الرصيد")
-
             try:
                 body = await page.inner_text("body")
                 await notify(f"📝 <b>نص الصفحة:</b>\n<pre>{body[:3000]}</pre>")
             except Exception as e:
                 log.error("text dump: %s", e)
-
             try:
                 html = await page.content()
                 Path("page_dump.html").write_text(html, encoding="utf-8")
                 await send_document("page_dump.html", "page_dump.html", "📄 HTML")
             except Exception as e:
                 log.error("html dump: %s", e)
-
             await notify(f"🔗 URL: <code>{page.url}</code>")
-            await context.close()
+            await ctx.close()
             return None
 
     except Exception as e:
         log.exception("login flow error")
         await notify(f"❌ خطأ: <code>{e}</code>")
-        await context.close()
+        await ctx.close()
         return None
 
 
-# ---------------- run_once ----------------
 async def run_once():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -435,7 +453,6 @@ async def run_once():
             await browser.close()
 
 
-# ---------------- main ----------------
 async def main():
     log.info("Bot starting...")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -450,15 +467,11 @@ async def main():
     await app.start()
     await app.updater.start_polling()
 
-    await notify(
-        "🚀 بوت Ooredoo جاهز.\n"
-        "اكتب /check باش نطلب منك البيانات ونجيب الرصيد."
-    )
+    await notify("🚀 بوت Ooredoo جاهز.\nاكتب /check.")
 
-    # نحافظو على التشغيل
-    stop_event = asyncio.Event()
+    stop = asyncio.Event()
     try:
-        await stop_event.wait()
+        await stop.wait()
     finally:
         await app.updater.stop()
         await app.stop()
