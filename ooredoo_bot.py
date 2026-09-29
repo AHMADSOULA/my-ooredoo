@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from telegram import Bot
 
-# ---------------- إعدادات ----------------
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -18,29 +17,21 @@ OOREDOO_PASS = os.getenv("OOREDOO_PASS")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "3600"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
-LOGIN_URL = "https://my.ooredoo.dz"
+SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
+DASHBOARD_URL = "https://my.ooredoo.dz/dashboard/my-ooredoo"
 STATE_FILE = Path("state.json")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ooredoo")
 
 
-# ---------------- Telegram ----------------
 async def notify(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured: %s", msg)
         return
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=msg,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg,
+                               parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         log.error("Telegram error: %s", e)
 
@@ -51,11 +42,7 @@ async def send_photo(path: str, caption: str = ""):
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         with open(path, "rb") as f:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=f,
-                caption=caption[:1024],
-            )
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=f, caption=caption[:1024])
     except Exception as e:
         log.error("Telegram photo error: %s", e)
 
@@ -66,25 +53,17 @@ async def send_document(path: str, filename: str, caption: str = ""):
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         with open(path, "rb") as f:
-            await bot.send_document(
-                chat_id=TELEGRAM_CHAT_ID,
-                document=f,
-                filename=filename,
-                caption=caption[:1024],
-            )
+            await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=f,
+                                    filename=filename, caption=caption[:1024])
     except Exception as e:
         log.error("Telegram document error: %s", e)
 
 
-# ---------------- Captcha detection ----------------
 async def detect_captcha(page) -> str | None:
     checks = {
         "recaptcha_v2": "iframe[src*='google.com/recaptcha/api2/anchor']",
-        "recaptcha_v3": "script[src*='recaptcha/api.js?render']",
         "hcaptcha": "iframe[src*='hcaptcha.com']",
         "turnstile": "iframe[src*='challenges.cloudflare.com']",
-        "image_captcha": "img[src*='captcha' i]",
-        "input_captcha": "input[name*='captcha' i]",
     }
     for name, sel in checks.items():
         try:
@@ -95,13 +74,11 @@ async def detect_captcha(page) -> str | None:
     return None
 
 
-# ---------------- Balance extraction ----------------
 async def extract_balance(page) -> str | None:
-    # 1) البحث في نص الصفحة
     try:
         body = await page.inner_text("body")
         patterns = [
-            r"(?:solde|balance|رصيد|الرصيد)\D{0,25}([\d]+[.,][\d]{1,2})",
+            r"(?:solde|balance|رصيد|الرصيد)\D{0,30}([\d]+[.,][\d]{1,2})",
             r"([\d]+[.,][\d]{1,2})\s*(?:DA|دج|DZD)",
         ]
         for p in patterns:
@@ -111,11 +88,9 @@ async def extract_balance(page) -> str | None:
     except Exception:
         pass
 
-    # 2) selectors محتملة
     selectors = [
         "[data-testid*='balance' i]",
         ".balance", ".balance-value", ".solde",
-        "text=/solde|balance|رصيد/i",
     ]
     for sel in selectors:
         try:
@@ -130,99 +105,139 @@ async def extract_balance(page) -> str | None:
     return None
 
 
-# ---------------- Login flow ----------------
+async def is_logged_in(page) -> bool:
+    """نتحققو فعلياً واش دخلنا — ماشي بالـ URL فقط"""
+    # إذا لقينا زر تسجيل الخروج أو قائمة الحساب، دخلنا
+    try:
+        if "/dashboard" in page.url:
+            return True
+    except Exception:
+        pass
+    # نتحققو من وجود صفحة تسجيل الدخول
+    try:
+        if await page.locator("input[type='password']").count() > 0:
+            return False
+        if await page.locator("text=Connectez-vous").count() > 0 and \
+           await page.locator("input[type='number']").count() > 0:
+            return False
+    except Exception:
+        pass
+    return True
+
+
 async def login_and_get_balance(browser) -> str | None:
+    # نجربو نستعملو الجلسة المحفوظة
     if STATE_FILE.exists():
+        log.info("Loading saved session")
         context = await browser.new_context(
             storage_state=str(STATE_FILE),
-            locale="ar-DZ",
+            locale="fr-FR",
             viewport={"width": 412, "height": 915},
         )
     else:
         context = await browser.new_context(
-            locale="ar-DZ",
+            locale="fr-FR",
             viewport={"width": 412, "height": 915},
-            user_agent=(
-                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
-            ),
+            user_agent=("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"),
         )
 
     page = await context.new_page()
 
     try:
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(3000)
+        # 1) نروحو مباشرة لصفحة /sign-in
+        log.info("Opening %s", SIGNIN_URL)
+        await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(4000)
 
-        logged_in = (
-            "login" not in page.url.lower()
-            and "auth" not in page.url.lower()
-            and "signin" not in page.url.lower()
-        )
-
-        if not logged_in:
-            # 1) كابتشا؟
+        # إذا الجلسة صالحة، راح يوجهنا لـ dashboard
+        if "/dashboard" in page.url:
+            log.info("Session still valid")
+            await notify("ℹ️ استعملنا جلسة محفوظة")
+        else:
+            # 2) كابتشا؟
             captcha = await detect_captcha(page)
             if captcha:
                 await page.screenshot(path="captcha.png", full_page=True)
                 await send_photo("captcha.png", f"⚠️ كاين كابتشا: {captcha}")
-                await notify("⚠️ البوت موقوف حتى نضيف حل الكابتشا.")
+                await notify("البوت موقوف حتى نضيف حل الكابتشا.")
                 await context.close()
                 return None
 
-            # 2) تعبئة الحقول
+            # 3) نعبئو اسم المستخدم / كلمة السر
+            # من HTML، /sign-in يستعمل حقول مشابهة
+            await page.screenshot(path="before_login.png", full_page=True)
+            await send_photo("before_login.png", "📸 صفحة /sign-in قبل التعبئة")
+
             try:
-                await page.fill(
-                    "input[name='username'], input[name='msisdn'], "
-                    "input[type='tel'], input[name='phone'], input[name='email']",
-                    OOREDOO_USER,
-                    timeout=15000,
-                )
-                await page.click(
-                    "button:has-text('Suivant'), button:has-text('التالي'), "
-                    "button[type='submit']"
-                )
-                await page.wait_for_timeout(2000)
+                # اسم المستخدم
+                user_sel = ("input[name='username'], input[name='userName'], "
+                            "input[id*='username' i], input[type='text'], "
+                            "input[type='number'], input[type='tel']")
+                await page.wait_for_selector(user_sel, timeout=15000)
+                await page.fill(user_sel, OOREDOO_USER)
+                log.info("Filled username")
 
-                if await page.locator("input[type='password']").count() > 0:
-                    await page.fill("input[type='password']", OOREDOO_PASS)
-                    await page.click(
-                        "button[type='submit'], "
-                        "button:has-text('Se connecter'), "
-                        "button:has-text('دخول'), button:has-text('تسجيل الدخول')"
-                    )
+                # كلمة السر
+                pwd_sel = "input[type='password']"
+                if await page.locator(pwd_sel).count() == 0:
+                    # يمكن في صفحة تانية، نضغطو على زر المتابعة
+                    try:
+                        await page.click("button[type='submit'], "
+                                         "button:has-text('Continuer'), "
+                                         "button:has-text('Suivant'), "
+                                         "button:has-text('تسجيل')", timeout=8000)
+                        await page.wait_for_timeout(2500)
+                    except Exception:
+                        pass
 
-                await page.wait_for_load_state("networkidle", timeout=45000)
+                if await page.locator(pwd_sel).count() > 0:
+                    await page.fill(pwd_sel, OOREDOO_PASS)
+                    log.info("Filled password")
+
+                # زر الدخول
+                try:
+                    await page.click("button[type='submit'], "
+                                     "button:has-text('Se connecter'), "
+                                     "button:has-text('Connexion'), "
+                                     "button:has-text('دخول'), "
+                                     "button:has-text('تسجيل الدخول')",
+                                     timeout=10000)
+                    log.info("Clicked login")
+                except Exception as e:
+                    log.warning("Login button click failed: %s", e)
+
+                # ننتظرو
+                await page.wait_for_timeout(5000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=30000)
+                except Exception:
+                    pass
+
             except Exception as e:
                 await page.screenshot(path="login_error.png", full_page=True)
-                await send_photo("login_error.png", "❌ فشل تسجيل الدخول")
+                await send_photo("login_error.png", "❌ فشل تعبئة الدخول")
                 await notify(f"❌ فشل تسجيل الدخول: <code>{e}</code>")
                 await context.close()
                 return None
 
-            await context.storage_state(path=str(STATE_FILE))
+            # 4) نحفظو الجلسة إذا دخلنا
+            if await is_logged_in(page):
+                log.info("Login successful, saving state")
+                await context.storage_state(path=str(STATE_FILE))
+            else:
+                await page.screenshot(path="login_failed.png", full_page=True)
+                await send_photo("login_failed.png", "❌ الصفحة بعد محاولة الدخول")
+                await notify(f"❌ ما دخلناش. URL: <code>{page.url}</code>")
+                await context.close()
+                return None
 
-        # 3) ننتظرو تحميل الصفحة
-        await page.wait_for_timeout(5000)
+        # 5) نروحو لصفحة الرصيد
+        log.info("Going to dashboard")
+        await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(6000)
 
-        # نحاولو نوصلو مباشرة لصفحة الرصيد
-        possible_balance_urls = [
-            "https://my.ooredoo.dz/dashboard",
-            "https://my.ooredoo.dz/home",
-            "https://my.ooredoo.dz/balance",
-            "https://my.ooredoo.dz/account",
-        ]
-        for url in possible_balance_urls:
-            try:
-                resp = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                if resp and resp.status < 400:
-                    await page.wait_for_timeout(3000)
-                    log.info("Tried URL: %s", url)
-                    break
-            except Exception:
-                continue
-
-        # 4) استخراج الرصيد
+        # 6) نستخرجو الرصيد
         balance = await extract_balance(page)
 
         if balance:
@@ -230,49 +245,39 @@ async def login_and_get_balance(browser) -> str | None:
             await context.close()
             return balance
         else:
-            # صورة
             await page.screenshot(path="no_balance.png", full_page=True)
-            await send_photo("no_balance.png", "📸 الصفحة الحالية — ما لقيتش الرصيد")
+            await send_photo("no_balance.png", "📸 dashboard — ما لقيتش الرصيد")
 
-            # نص الصفحة
             try:
-                body_text = await page.inner_text("body")
-                snippet = body_text[:3500]
-                await notify(f"📝 <b>نص الصفحة (أول 3500 حرف):</b>\n<pre>{snippet}</pre>")
+                body = await page.inner_text("body")
+                await notify(f"📝 <b>نص الصفحة:</b>\n<pre>{body[:3000]}</pre>")
             except Exception as e:
-                await notify(f"⚠️ فشل قراءة النص: {e}")
+                log.error("text dump: %s", e)
 
-            # HTML كامل
             try:
                 html = await page.content()
                 Path("page_dump.html").write_text(html, encoding="utf-8")
-                await send_document("page_dump.html", "page_dump.html", "📄 HTML كامل")
+                await send_document("page_dump.html", "page_dump.html", "📄 HTML")
             except Exception as e:
-                await notify(f"⚠️ فشل إرسال HTML: {e}")
+                log.error("html dump: %s", e)
 
-            # URL الحالي
-            await notify(f"🔗 URL الحالي: <code>{page.url}</code>")
-
+            await notify(f"🔗 URL: <code>{page.url}</code>")
             await context.close()
             return None
 
     except Exception as e:
+        log.exception("login flow error")
         await notify(f"❌ خطأ عام: <code>{e}</code>")
         await context.close()
         return None
 
 
-# ---------------- Main loop ----------------
 async def run_once():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--single-process",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-gpu", "--single-process"],
         )
         try:
             await login_and_get_balance(browser)
