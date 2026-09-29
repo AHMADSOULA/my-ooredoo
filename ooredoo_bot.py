@@ -96,7 +96,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.delete()
         except Exception:
             pass
-        await update.message.reply_text("✅ توصلت بكلمة السر. جاري المحاولة...")
+        await update.message.reply_text("✅ توصلت بكلمة السر. جاري الدخول...")
         return
 
     await update.message.reply_text("ℹ️ اكتب /check لجلب الرصيد.")
@@ -111,7 +111,7 @@ async def ask_username() -> str:
         result = await asyncio.wait_for(fut, timeout=300)
     except asyncio.TimeoutError:
         WAITING["username"] = None
-        raise Exception("انتهت المدة بلا رد")
+        raise Exception("انتهت المدة (5 دقائق) بلا رد")
     WAITING["username"] = None
     return result
 
@@ -125,7 +125,7 @@ async def ask_password() -> str:
         result = await asyncio.wait_for(fut, timeout=300)
     except asyncio.TimeoutError:
         WAITING["password"] = None
-        raise Exception("انتهت المدة بلا رد")
+        raise Exception("انتهت المدة (5 دقائق) بلا رد")
     WAITING["password"] = None
     return result
 
@@ -189,11 +189,9 @@ async def is_logged_in(page) -> bool:
 
 # ================== Hide overlays ==================
 async def hide_overlays(page):
-    """نخفيو الإعلانات و cookie banners وكل اللي يغطي الحقول"""
     try:
         await page.evaluate("""
             () => {
-                // Vue/Element overlays
                 const selectors = [
                     '.v-overlay', '.v-overlay__scrim',
                     '.swiper', '.swiper-wrapper', '.swiper-slide',
@@ -209,7 +207,6 @@ async def hide_overlays(page):
                         el.style.pointerEvents = 'none';
                     });
                 }
-                // أي عنصر fixed/absolute كبير
                 document.querySelectorAll('*').forEach(el => {
                     const s = getComputedStyle(el);
                     if ((s.position === 'fixed' || s.position === 'absolute') &&
@@ -227,91 +224,25 @@ async def hide_overlays(page):
         log.warning("hide_overlays failed: %s", e)
 
 
-# ================== Phone variants ==================
+# ================== Phone variant — صيغة واحدة فقط ==================
 def phone_variants(raw: str) -> list[str]:
-    digits = re.sub(r"\D", "", raw or "")
-    variants = []
-    if raw:
-        variants.append(raw.strip())
-    if digits.startswith("0") and len(digits) >= 10:
-        local = digits[1:]
-        variants.append(f"+213{local}")
-        variants.append(f"213{local}")
-    if digits.startswith("213"):
-        rest = digits[3:]
-        variants.append(f"+{digits}")
-        variants.append(digits)
-        variants.append(f"0{rest}")
-    if digits.startswith("05"):
-        rest = digits[1:]
-        variants.append(f"+213{rest}")
-        variants.append(f"213{rest}")
-
-    seen, out = set(), []
-    for v in variants:
-        if v and v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
+    """صيغة واحدة فقط — كما كتبها المستخدم"""
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    return [raw]
 
 
 # ================== Vue-friendly fill ==================
-async def _set_vue_value(loc, value: str):
-    """نحطو القيمة بـ JS مباشرة — يتجاوز click والـ overlay"""
-    await loc.evaluate("""
-        (el, val) => {
-            el.focus();
-            const setter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value'
-            ).set;
-            setter.call(el, val);
-            el.dispatchEvent(new Event('input',  {bubbles: true}));
-            el.dispatchEvent(new Event('change', {bubbles: true}));
-            el.dispatchEvent(new Event('blur',   {bubbles: true}));
-            el.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
-        }
-    """, value)
-
-
-async def _set_vue_value_by_selector(page, selector: str, value: str) -> bool:
-    """نفس الحاجة لكن بالـ selector"""
-    try:
-        result = await page.evaluate("""
-            ({sel, val}) => {
-                const el = document.querySelector(sel);
-                if (!el) return false;
-                el.focus();
-                const setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value'
-                ).set;
-                setter.call(el, val);
-                el.dispatchEvent(new Event('input',  {bubbles: true}));
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-                el.dispatchEvent(new Event('blur',   {bubbles: true}));
-                el.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
-                return true;
-            }
-        """, {"sel": selector, "val": value})
-        return bool(result)
-    except Exception as e:
-        log.warning("JS set failed: %s", e)
-        return False
-
-
 async def fill_username(page, username: str) -> bool:
-    """4 محاولات باش نعبّيو اسم المستخدم"""
-
-    # 0) JS مباشر بلا click
+    # JS مباشر — بلا click
     try:
-        # نلقاو الـ input عن طريق الـ label
         found = await page.evaluate("""
             (val) => {
-                // ندورو على label فيه "Nom d'utilisateur"
                 const labels = [...document.querySelectorAll('label, .v-label, p')];
                 let target = null;
                 for (const l of labels) {
                     if (/nom d'utilisateur/i.test(l.textContent || '')) {
-                        // ندورو على input قريب
                         let n = l.parentElement;
                         for (let i = 0; i < 5 && n; i++) {
                             const inp = n.querySelector('input:not([type=password]):not([type=hidden])');
@@ -321,7 +252,6 @@ async def fill_username(page, username: str) -> bool:
                         if (target) break;
                     }
                 }
-                // fallback: أي input مش password
                 if (!target) {
                     const inputs = [...document.querySelectorAll('input')].filter(i => {
                         const t = i.type || 'text';
@@ -345,12 +275,12 @@ async def fill_username(page, username: str) -> bool:
             }
         """, username)
         if found:
-            log.info("Username filled via JS (no click)")
+            log.info("Username filled via JS")
             return True
     except Exception as e:
-        log.warning("JS strategy failed: %s", e)
+        log.warning("JS username failed: %s", e)
 
-    # 1) XPath عن طريق label مع force
+    # fallback force
     try:
         xp = "xpath=//label[contains(., \"Nom d'utilisateur\")]/following::input[1]"
         inp = page.locator(xp).first
@@ -365,33 +295,10 @@ async def fill_username(page, username: str) -> bool:
     except Exception as e:
         log.warning("label force failed: %s", e)
 
-    # 2) iteration مع force
-    try:
-        all_inputs = page.locator("input:visible")
-        count = await all_inputs.count()
-        for i in range(count):
-            inp = all_inputs.nth(i)
-            t = await inp.get_attribute("type") or "text"
-            ph = (await inp.get_attribute("placeholder") or "").lower()
-            if t == "password" or t in ("hidden", "submit", "button", "checkbox", "radio"):
-                continue
-            if any(x in ph for x in ("search", "recherche")):
-                continue
-            await inp.scroll_into_view_if_needed()
-            await inp.click(force=True, timeout=5000)
-            await inp.fill("", force=True)
-            await inp.press_sequentially(username, delay=50)
-            await inp.press("Tab")
-            log.info("Username filled via input[%d] (force)", i)
-            return True
-    except Exception as e:
-        log.warning("iteration force failed: %s", e)
-
     return False
 
 
 async def fill_password(page, password: str) -> bool:
-    # JS أولاً
     try:
         ok = await page.evaluate("""
             (val) => {
@@ -414,7 +321,6 @@ async def fill_password(page, password: str) -> bool:
     except Exception as e:
         log.warning("pwd JS failed: %s", e)
 
-    # fallback
     try:
         pwd = page.locator("input[type='password']").first
         if await pwd.count() > 0:
@@ -431,7 +337,6 @@ async def fill_password(page, password: str) -> bool:
 
 
 async def click_connexion(page) -> bool:
-    # JS أولاً
     try:
         ok = await page.evaluate("""
             () => {
@@ -451,7 +356,6 @@ async def click_connexion(page) -> bool:
     except Exception as e:
         log.warning("JS connexion failed: %s", e)
 
-    # fallback مع force
     try:
         btn = page.locator(
             "button:has-text('Connexion'), "
@@ -471,81 +375,9 @@ async def click_connexion(page) -> bool:
     return False
 
 
-# ================== Try variant ==================
-async def try_login_with_variant(
-    page, phone: str, password: str, variant_index: int, total: int,
-) -> bool:
-    log.info("Trying variant %d/%d: %s", variant_index, total, phone)
-    await notify(f"🔁 محاولة {variant_index}/{total}: <code>{phone}</code>")
-
-    await hide_overlays(page)
-
-    # نمسحو الحقول
-    try:
-        await page.evaluate("""
-            () => {
-                document.querySelectorAll('input').forEach(inp => {
-                    if (inp.type === 'text' || inp.type === 'password' || !inp.type) {
-                        inp.value = '';
-                        inp.dispatchEvent(new Event('input', {bubbles: true}));
-                    }
-                });
-            }
-        """)
-    except Exception:
-        pass
-
-    # اسم المستخدم
-    if not await fill_username(page, phone):
-        log.error("Could not fill username")
-        await page.screenshot(path=f"fail_user_v{variant_index}.png", full_page=True)
-        await send_photo(f"fail_user_v{variant_index}.png",
-                         f"❌ فشل تعبئة اسم المستخدم (محاولة {variant_index})")
-        return False
-
-    # كلمة السر
-    if not await fill_password(page, password):
-        log.error("Could not fill password")
-        await page.screenshot(path=f"fail_pwd_v{variant_index}.png", full_page=True)
-        await send_photo(f"fail_pwd_v{variant_index}.png",
-                         f"❌ فشل تعبئة كلمة السر (محاولة {variant_index})")
-        return False
-
-    await page.wait_for_timeout(1500)
-
-    shot = f"filled_v{variant_index}.png"
-    await page.screenshot(path=shot, full_page=True)
-    await send_photo(shot, f"📸 محاولة {variant_index}: {phone}")
-
-    # Connexion
-    if not await click_connexion(page):
-        await send_photo(shot, f"❌ زر Connexion ما تلقاش (محاولة {variant_index})")
-        return False
-
-    await page.wait_for_timeout(7000)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=30000)
-    except Exception:
-        pass
-
-    if await is_logged_in(page):
-        await send_photo(shot, f"✅ نجحت الصيغة: {phone}")
-        return True
-    else:
-        fail = f"failed_v{variant_index}.png"
-        await page.screenshot(path=fail, full_page=True)
-        await send_photo(fail, f"❌ فشلت الصيغة: {phone}")
-        try:
-            await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
-            await hide_overlays(page)
-        except Exception:
-            pass
-        return False
-
-
 # ================== Main flow ==================
 async def login_and_get_balance(browser) -> str | None:
+    # 1) جلسة محفوظة
     if STATE_FILE.exists():
         log.info("Trying saved session")
         ctx = await browser.new_context(
@@ -572,6 +404,7 @@ async def login_and_get_balance(browser) -> str | None:
             except Exception:
                 pass
 
+    # 2) جلسة جديدة
     ctx = await browser.new_context(
         locale="fr-FR",
         viewport={"width": 412, "height": 915},
@@ -590,7 +423,6 @@ async def login_and_get_balance(browser) -> str | None:
         except Exception:
             pass
 
-        # نخفيو overlays
         await hide_overlays(page)
         await page.wait_for_timeout(500)
 
@@ -602,6 +434,7 @@ async def login_and_get_balance(browser) -> str | None:
             await ctx.close()
             return None
 
+        # نطلبو البيانات
         raw_phone = await ask_username()
         password = await ask_password()
 
@@ -611,28 +444,72 @@ async def login_and_get_balance(browser) -> str | None:
             await ctx.close()
             return None
 
-        log.info("Variants: %s", variants)
+        phone = variants[0]
+        log.info("Using phone: %s", phone)
+        await notify(f"🔁 جاري الدخول بـ: <code>{phone}</code>")
 
-        success = False
-        for idx, phone in enumerate(variants, 1):
-            try:
-                if await try_login_with_variant(page, phone, password, idx, len(variants)):
-                    success = True
-                    break
-            except Exception as e:
-                log.exception("variant %d error", idx)
-                await notify(f"❌ خطأ في المحاولة {idx}: <code>{e}</code>")
-
-        if not success:
-            await notify("❌ فشلت كل الصيغ. تحقق من الرقم وكلمة السر.")
+        # اسم المستخدم
+        if not await fill_username(page, phone):
+            await page.screenshot(path="fail_user.png", full_page=True)
+            await send_photo("fail_user.png", "❌ فشل تعبئة اسم المستخدم")
             await ctx.close()
             return None
 
+        # كلمة السر
+        if not await fill_password(page, password):
+            await page.screenshot(path="fail_pwd.png", full_page=True)
+            await send_photo("fail_pwd.png", "❌ فشل تعبئة كلمة السر")
+            await ctx.close()
+            return None
+
+        await page.wait_for_timeout(1500)
+        await page.screenshot(path="filled.png", full_page=True)
+        await send_photo("filled.png", "📸 الحقول معبّية")
+
+        # Connexion
+        if not await click_connexion(page):
+            await notify("❌ زر Connexion ما تلقاش")
+            await ctx.close()
+            return None
+
+        log.info("Clicked Connexion, waiting...")
+        await notify("⏳ جاري انتظار نتيجة الدخول...")
+
+        # ننتظرو مدة كافية
+        await page.wait_for_timeout(10000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=30000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(3000)
+
+        # نصوّرو النتيجة
+        await page.screenshot(path="after_login.png", full_page=True)
+        await send_photo("after_login.png", f"📸 بعد الدخول — URL: {page.url}")
+
+        # واش دخلنا؟
+        if not await is_logged_in(page):
+            await notify(f"❌ ما دخلناش. URL: <code>{page.url}</code>")
+
+            # نحفظو HTML والصفحة باش نحللو
+            try:
+                html = await page.content()
+                Path("after_login.html").write_text(html, encoding="utf-8")
+                await send_document("after_login.html", "after_login.html", "📄 HTML")
+            except Exception as e:
+                log.error("dump failed: %s", e)
+
+            await ctx.close()
+            return None
+
+        # نجحنا! نحفظو الجلسة
         await ctx.storage_state(path=str(STATE_FILE))
         log.info("Session saved")
+        await notify("✅ دخلنا بنجاح! نحفظو الجلسة ونروحو للرصيد...")
 
+        # نروحو للرصيد
         await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(9000)
         await hide_overlays(page)
 
         balance = await extract_balance(page)
