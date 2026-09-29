@@ -31,10 +31,8 @@ async def notify(msg: str):
         return
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID, text=msg,
-            parse_mode="HTML", disable_web_page_preview=True,
-        )
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg,
+                               parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         log.error("Telegram error: %s", e)
 
@@ -45,9 +43,7 @@ async def send_photo(path: str, caption: str = ""):
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         with open(path, "rb") as f:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID, photo=f, caption=caption[:1024],
-            )
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=f, caption=caption[:1024])
     except Exception as e:
         log.error("Telegram photo error: %s", e)
 
@@ -58,10 +54,8 @@ async def send_document(path: str, filename: str, caption: str = ""):
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         with open(path, "rb") as f:
-            await bot.send_document(
-                chat_id=TELEGRAM_CHAT_ID, document=f,
-                filename=filename, caption=caption[:1024],
-            )
+            await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=f,
+                                    filename=filename, caption=caption[:1024])
     except Exception as e:
         log.error("Telegram document error: %s", e)
 
@@ -70,7 +64,7 @@ async def send_document(path: str, filename: str, caption: str = ""):
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != TELEGRAM_CHAT_ID:
         return
-    await update.message.reply_text("🚀 بوت Ooredoo جاهز.\nاكتب /check لجلب الرصيد.")
+    await update.message.reply_text("🚀 بوت Ooredoo جاهز.\nاكتب /check.")
 
 
 async def check_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -117,7 +111,7 @@ async def ask_username() -> str:
         result = await asyncio.wait_for(fut, timeout=300)
     except asyncio.TimeoutError:
         WAITING["username"] = None
-        raise Exception("انتهت المدة (5 دقائق) بلا رد")
+        raise Exception("انتهت المدة بلا رد")
     WAITING["username"] = None
     return result
 
@@ -131,7 +125,7 @@ async def ask_password() -> str:
         result = await asyncio.wait_for(fut, timeout=300)
     except asyncio.TimeoutError:
         WAITING["password"] = None
-        raise Exception("انتهت المدة (5 دقائق) بلا رد")
+        raise Exception("انتهت المدة بلا رد")
     WAITING["password"] = None
     return result
 
@@ -170,11 +164,7 @@ async def extract_balance(page) -> str | None:
     except Exception:
         pass
 
-    selectors = [
-        "[data-testid*='balance' i]",
-        ".balance", ".balance-value", ".solde",
-    ]
-    for sel in selectors:
+    for sel in ["[data-testid*='balance' i]", ".balance", ".balance-value", ".solde"]:
         try:
             loc = page.locator(sel).first
             if await loc.count() > 0:
@@ -197,38 +187,67 @@ async def is_logged_in(page) -> bool:
     return True
 
 
-# ================== Phone format variants ==================
+# ================== Hide overlays ==================
+async def hide_overlays(page):
+    """نخفيو الإعلانات و cookie banners وكل اللي يغطي الحقول"""
+    try:
+        await page.evaluate("""
+            () => {
+                // Vue/Element overlays
+                const selectors = [
+                    '.v-overlay', '.v-overlay__scrim',
+                    '.swiper', '.swiper-wrapper', '.swiper-slide',
+                    '.cookie-banner', '.cookie-consent', '.cc-window',
+                    '.modal', '.modal-backdrop',
+                    '#onetrust-banner-sdk',
+                    '.grecaptcha-badge',
+                    '.v-snackbar', '.v-snackbar__wrapper',
+                ];
+                for (const sel of selectors) {
+                    document.querySelectorAll(sel).forEach(el => {
+                        el.style.display = 'none';
+                        el.style.pointerEvents = 'none';
+                    });
+                }
+                // أي عنصر fixed/absolute كبير
+                document.querySelectorAll('*').forEach(el => {
+                    const s = getComputedStyle(el);
+                    if ((s.position === 'fixed' || s.position === 'absolute') &&
+                        el.offsetWidth > 200 && el.offsetHeight > 100) {
+                        const r = el.getBoundingClientRect();
+                        if (r.top < 900 && r.left < 500 && r.height > 200) {
+                            el.style.display = 'none';
+                        }
+                    }
+                });
+            }
+        """)
+        log.info("Overlays hidden")
+    except Exception as e:
+        log.warning("hide_overlays failed: %s", e)
+
+
+# ================== Phone variants ==================
 def phone_variants(raw: str) -> list[str]:
-    """نولّدو كل الصيغ الممكنة للرقم"""
     digits = re.sub(r"\D", "", raw or "")
     variants = []
-
-    # 1) كما هو
     if raw:
         variants.append(raw.strip())
-
-    # 2) +213 + local بدون 0
     if digits.startswith("0") and len(digits) >= 10:
         local = digits[1:]
         variants.append(f"+213{local}")
         variants.append(f"213{local}")
-
-    # 3) إذا بدا بـ 213
     if digits.startswith("213"):
         rest = digits[3:]
         variants.append(f"+{digits}")
         variants.append(digits)
         variants.append(f"0{rest}")
-
-    # 4) إذا بدا بـ 05...
     if digits.startswith("05"):
         rest = digits[1:]
         variants.append(f"+213{rest}")
         variants.append(f"213{rest}")
 
-    # تنظيف + إزالة التكرار مع الحفاظ على الترتيب
-    seen = set()
-    out = []
+    seen, out = set(), []
     for v in variants:
         if v and v not in seen:
             seen.add(v)
@@ -236,30 +255,117 @@ def phone_variants(raw: str) -> list[str]:
     return out
 
 
-# ================== Field filling (Vue friendly) ==================
-async def _fill_field(loc, value: str):
-    await loc.scroll_into_view_if_needed()
-    await loc.click()
-    await loc.fill("")
-    await loc.press_sequentially(value, delay=60)
-    await loc.press("Tab")
+# ================== Vue-friendly fill ==================
+async def _set_vue_value(loc, value: str):
+    """نحطو القيمة بـ JS مباشرة — يتجاوز click والـ overlay"""
+    await loc.evaluate("""
+        (el, val) => {
+            el.focus();
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            ).set;
+            setter.call(el, val);
+            el.dispatchEvent(new Event('input',  {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            el.dispatchEvent(new Event('blur',   {bubbles: true}));
+            el.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
+        }
+    """, value)
+
+
+async def _set_vue_value_by_selector(page, selector: str, value: str) -> bool:
+    """نفس الحاجة لكن بالـ selector"""
+    try:
+        result = await page.evaluate("""
+            ({sel, val}) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                el.focus();
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input',  {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur',   {bubbles: true}));
+                el.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
+                return true;
+            }
+        """, {"sel": selector, "val": value})
+        return bool(result)
+    except Exception as e:
+        log.warning("JS set failed: %s", e)
+        return False
 
 
 async def fill_username(page, username: str) -> bool:
-    """نلقاو حقل اسم المستخدم ونعبّيوه"""
-    # 1) عن طريق label
+    """4 محاولات باش نعبّيو اسم المستخدم"""
+
+    # 0) JS مباشر بلا click
     try:
-        xp = ("xpath=//label[contains(., \"Nom d'utilisateur\")]"
-              "/following::input[1]")
-        inp = page.locator(xp).first
-        if await inp.count() > 0:
-            await _fill_field(inp, username)
-            log.info("Username filled via label")
+        # نلقاو الـ input عن طريق الـ label
+        found = await page.evaluate("""
+            (val) => {
+                // ندورو على label فيه "Nom d'utilisateur"
+                const labels = [...document.querySelectorAll('label, .v-label, p')];
+                let target = null;
+                for (const l of labels) {
+                    if (/nom d'utilisateur/i.test(l.textContent || '')) {
+                        // ندورو على input قريب
+                        let n = l.parentElement;
+                        for (let i = 0; i < 5 && n; i++) {
+                            const inp = n.querySelector('input:not([type=password]):not([type=hidden])');
+                            if (inp) { target = inp; break; }
+                            n = n.parentElement;
+                        }
+                        if (target) break;
+                    }
+                }
+                // fallback: أي input مش password
+                if (!target) {
+                    const inputs = [...document.querySelectorAll('input')].filter(i => {
+                        const t = i.type || 'text';
+                        return t !== 'password' && t !== 'hidden' &&
+                               i.offsetParent !== null;
+                    });
+                    if (inputs.length > 0) target = inputs[0];
+                }
+                if (!target) return false;
+
+                target.focus();
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(target, val);
+                target.dispatchEvent(new Event('input',  {bubbles: true}));
+                target.dispatchEvent(new Event('change', {bubbles: true}));
+                target.dispatchEvent(new Event('blur',   {bubbles: true}));
+                target.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
+                return true;
+            }
+        """, username)
+        if found:
+            log.info("Username filled via JS (no click)")
             return True
     except Exception as e:
-        log.warning("label strategy failed: %s", e)
+        log.warning("JS strategy failed: %s", e)
 
-    # 2) iteration على inputs
+    # 1) XPath عن طريق label مع force
+    try:
+        xp = "xpath=//label[contains(., \"Nom d'utilisateur\")]/following::input[1]"
+        inp = page.locator(xp).first
+        if await inp.count() > 0:
+            await inp.scroll_into_view_if_needed()
+            await inp.click(force=True, timeout=5000)
+            await inp.fill("", force=True)
+            await inp.press_sequentially(username, delay=50)
+            await inp.press("Tab")
+            log.info("Username filled via label (force)")
+            return True
+    except Exception as e:
+        log.warning("label force failed: %s", e)
+
+    # 2) iteration مع force
     try:
         all_inputs = page.locator("input:visible")
         count = await all_inputs.count()
@@ -271,139 +377,175 @@ async def fill_username(page, username: str) -> bool:
                 continue
             if any(x in ph for x in ("search", "recherche")):
                 continue
-            await _fill_field(inp, username)
-            log.info("Username filled via input[%d]", i)
+            await inp.scroll_into_view_if_needed()
+            await inp.click(force=True, timeout=5000)
+            await inp.fill("", force=True)
+            await inp.press_sequentially(username, delay=50)
+            await inp.press("Tab")
+            log.info("Username filled via input[%d] (force)", i)
             return True
     except Exception as e:
-        log.warning("iteration failed: %s", e)
+        log.warning("iteration force failed: %s", e)
 
     return False
 
 
 async def fill_password(page, password: str) -> bool:
+    # JS أولاً
     try:
-        sel = "input[type='password']"
-        await page.wait_for_selector(sel, timeout=10000)
-        pwd = page.locator(sel).first
-        await _fill_field(pwd, password)
-        log.info("Password filled")
-        return True
+        ok = await page.evaluate("""
+            (val) => {
+                const pwd = document.querySelector('input[type=password]');
+                if (!pwd) return false;
+                pwd.focus();
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(pwd, val);
+                pwd.dispatchEvent(new Event('input',  {bubbles: true}));
+                pwd.dispatchEvent(new Event('change', {bubbles: true}));
+                pwd.dispatchEvent(new Event('blur',   {bubbles: true}));
+                return true;
+            }
+        """, password)
+        if ok:
+            log.info("Password filled via JS")
+            return True
     except Exception as e:
-        log.warning("password fill failed: %s", e)
-        return False
+        log.warning("pwd JS failed: %s", e)
 
-
-async def clear_field(loc):
-    await loc.click()
-    await loc.fill("")
-    await loc.press("Tab")
+    # fallback
+    try:
+        pwd = page.locator("input[type='password']").first
+        if await pwd.count() > 0:
+            await pwd.scroll_into_view_if_needed()
+            await pwd.click(force=True, timeout=5000)
+            await pwd.fill("", force=True)
+            await pwd.press_sequentially(password, delay=50)
+            await pwd.press("Tab")
+            log.info("Password filled (force)")
+            return True
+    except Exception as e:
+        log.warning("pwd force failed: %s", e)
+    return False
 
 
 async def click_connexion(page) -> bool:
-    """يضغط زر Connexion، يستنى يكون enabled، وإلا force"""
+    # JS أولاً
+    try:
+        ok = await page.evaluate("""
+            () => {
+                const btns = [...document.querySelectorAll('button')];
+                const target = btns.find(b =>
+                    /connexion|se connecter/i.test(b.textContent || '')
+                );
+                if (!target) return false;
+                target.removeAttribute('disabled');
+                target.click();
+                return true;
+            }
+        """)
+        if ok:
+            log.info("Connexion clicked via JS")
+            return True
+    except Exception as e:
+        log.warning("JS connexion failed: %s", e)
+
+    # fallback مع force
     try:
         btn = page.locator(
             "button:has-text('Connexion'), "
             "button:has-text('Se connecter'), "
             "button[type='submit']"
         ).first
-        if await btn.count() == 0:
-            return False
-
-        # نستنى 10 ثواني يكون enabled
-        for _ in range(33):
-            d = await btn.get_attribute("disabled")
-            if d is None:
-                break
-            await page.wait_for_timeout(300)
-
-        try:
-            await btn.click(timeout=5000)
-            log.info("Connexion clicked")
-            return True
-        except Exception:
-            log.warning("normal click failed, forcing")
-            await btn.click(force=True)
+        if await btn.count() > 0:
+            await btn.scroll_into_view_if_needed()
+            try:
+                await btn.click(timeout=5000)
+            except Exception:
+                await btn.click(force=True)
             log.info("Connexion clicked (force)")
             return True
     except Exception as e:
         log.error("click_connexion failed: %s", e)
-        return False
+    return False
 
 
-# ================== Main login flow ==================
+# ================== Try variant ==================
 async def try_login_with_variant(
     page, phone: str, password: str, variant_index: int, total: int,
 ) -> bool:
-    """يحاول يدخل بصيغة معينة. يرجع True إذا نجح."""
     log.info("Trying variant %d/%d: %s", variant_index, total, phone)
     await notify(f"🔁 محاولة {variant_index}/{total}: <code>{phone}</code>")
 
+    await hide_overlays(page)
+
     # نمسحو الحقول
     try:
-        user_field = page.locator(
-            "xpath=//label[contains(., \"Nom d'utilisateur\")]/following::input[1]"
-        ).first
-        if await user_field.count() > 0:
-            await clear_field(user_field)
+        await page.evaluate("""
+            () => {
+                document.querySelectorAll('input').forEach(inp => {
+                    if (inp.type === 'text' || inp.type === 'password' || !inp.type) {
+                        inp.value = '';
+                        inp.dispatchEvent(new Event('input', {bubbles: true}));
+                    }
+                });
+            }
+        """)
     except Exception:
         pass
 
-    try:
-        pwd_field = page.locator("input[type='password']").first
-        if await pwd_field.count() > 0:
-            await clear_field(pwd_field)
-    except Exception:
-        pass
-
-    # نعبّيو اسم المستخدم
+    # اسم المستخدم
     if not await fill_username(page, phone):
         log.error("Could not fill username")
+        await page.screenshot(path=f"fail_user_v{variant_index}.png", full_page=True)
+        await send_photo(f"fail_user_v{variant_index}.png",
+                         f"❌ فشل تعبئة اسم المستخدم (محاولة {variant_index})")
         return False
 
-    # نعبّيو كلمة السر
+    # كلمة السر
     if not await fill_password(page, password):
         log.error("Could not fill password")
+        await page.screenshot(path=f"fail_pwd_v{variant_index}.png", full_page=True)
+        await send_photo(f"fail_pwd_v{variant_index}.png",
+                         f"❌ فشل تعبئة كلمة السر (محاولة {variant_index})")
         return False
 
-    await page.wait_for_timeout(1200)
+    await page.wait_for_timeout(1500)
 
-    # نصوّرو باش نشوفو الحالة
-    shot_name = f"filled_v{variant_index}.png"
-    await page.screenshot(path=shot_name, full_page=True)
+    shot = f"filled_v{variant_index}.png"
+    await page.screenshot(path=shot, full_page=True)
+    await send_photo(shot, f"📸 محاولة {variant_index}: {phone}")
 
-    # نديرو Connexion
+    # Connexion
     if not await click_connexion(page):
-        await send_photo(shot_name, f"❌ محاولة {variant_index}: الزر ما تلقاش")
+        await send_photo(shot, f"❌ زر Connexion ما تلقاش (محاولة {variant_index})")
         return False
 
-    # نستناو النتيجة
-    await page.wait_for_timeout(6000)
+    await page.wait_for_timeout(7000)
     try:
         await page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
         pass
 
-    # واش دخلنا؟
     if await is_logged_in(page):
-        await send_photo(shot_name, f"✅ نجحت الصيغة: {phone}")
+        await send_photo(shot, f"✅ نجحت الصيغة: {phone}")
         return True
     else:
-        # نصوّرو الخطأ
-        err_name = f"failed_v{variant_index}.png"
-        await page.screenshot(path=err_name, full_page=True)
-        await send_photo(err_name, f"❌ فشلت الصيغة: {phone}")
-        # نرجعو للصفحة
+        fail = f"failed_v{variant_index}.png"
+        await page.screenshot(path=fail, full_page=True)
+        await send_photo(fail, f"❌ فشلت الصيغة: {phone}")
         try:
             await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(3000)
+            await hide_overlays(page)
         except Exception:
             pass
         return False
 
 
+# ================== Main flow ==================
 async def login_and_get_balance(browser) -> str | None:
-    # 1) الجلسة المحفوظة
     if STATE_FILE.exists():
         log.info("Trying saved session")
         ctx = await browser.new_context(
@@ -416,7 +558,7 @@ async def login_and_get_balance(browser) -> str | None:
             await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=45000)
             await page.wait_for_timeout(4000)
             if await is_logged_in(page):
-                log.info("Saved session valid")
+                log.info("Session valid")
                 balance = await extract_balance(page)
                 if balance:
                     await notify(f"💰 <b>الرصيد:</b> {balance} دج")
@@ -430,7 +572,6 @@ async def login_and_get_balance(browser) -> str | None:
             except Exception:
                 pass
 
-    # 2) جلسة جديدة
     ctx = await browser.new_context(
         locale="fr-FR",
         viewport={"width": 412, "height": 915},
@@ -442,14 +583,17 @@ async def login_and_get_balance(browser) -> str | None:
     try:
         log.info("Opening %s", SIGNIN_URL)
         await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(6000)
 
         try:
             await page.wait_for_selector("input", timeout=15000)
         except Exception:
             pass
 
-        # كابتشا؟
+        # نخفيو overlays
+        await hide_overlays(page)
+        await page.wait_for_timeout(500)
+
         captcha = await detect_captcha(page)
         if captcha:
             await page.screenshot(path="captcha.png", full_page=True)
@@ -458,7 +602,6 @@ async def login_and_get_balance(browser) -> str | None:
             await ctx.close()
             return None
 
-        # نطلبو البيانات
         raw_phone = await ask_username()
         password = await ask_password()
 
@@ -468,19 +611,16 @@ async def login_and_get_balance(browser) -> str | None:
             await ctx.close()
             return None
 
-        log.info("Variants to try: %s", variants)
+        log.info("Variants: %s", variants)
 
         success = False
         for idx, phone in enumerate(variants, 1):
             try:
-                ok = await try_login_with_variant(
-                    page, phone, password, idx, len(variants),
-                )
-                if ok:
+                if await try_login_with_variant(page, phone, password, idx, len(variants)):
                     success = True
                     break
             except Exception as e:
-                log.exception("variant %d failed: %s", idx, e)
+                log.exception("variant %d error", idx)
                 await notify(f"❌ خطأ في المحاولة {idx}: <code>{e}</code>")
 
         if not success:
@@ -488,13 +628,12 @@ async def login_and_get_balance(browser) -> str | None:
             await ctx.close()
             return None
 
-        # نحفظو الجلسة
         await ctx.storage_state(path=str(STATE_FILE))
         log.info("Session saved")
 
-        # نروحو للرصيد
         await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(7000)
+        await page.wait_for_timeout(8000)
+        await hide_overlays(page)
 
         balance = await extract_balance(page)
         if balance:
