@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -18,6 +18,8 @@ HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
 DASHBOARD_URL = "https://my.ooredoo.dz/dashboard/my-ooredoo"
 STATE_FILE = Path("state.json")
+
+MAX_LOGIN_ATTEMPTS = 3  # عدد المحاولات عند الخطأ
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ooredoo")
@@ -149,6 +151,105 @@ async def detect_captcha(page) -> str | None:
     return None
 
 
+# ================== Error detection ==================
+async def find_error_message(page) -> str | None:
+    """يبحث عن رسائل الخطأ الشائعة"""
+    try:
+        # نبحث في النصوص عن كلمات مفتاحية
+        body = await page.inner_text("body")
+        patterns = [
+            r"(identifiants?\s+incorrect[s]?[^\n]{0,100})",
+            r"(mot de passe\s+incorrect[^\n]{0,100})",
+            r"(nom d'utilisateur\s+incorrect[^\n]{0,100})",
+            r"(utilisateur\s+non\s+trouvé[^\n]{0,100})",
+            r"(erreur[^\n]{0,150})",
+            r"(échec[^\n]{0,100})",
+            r"(veuillez\s+réessayer[^\n]{0,100})",
+            r"(réessayez[^\n]{0,100})",
+            r"(خطأ[^\n]{0,100})",
+            r"(كلمة السر[^\n]{0,80}غير صحيحة[^\n]{0,80})",
+            r"(المستخدم[^\n]{0,80}غير موجود[^\n]{0,80})",
+        ]
+        for p in patterns:
+            m = re.search(p, body, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+
+        # رسائل Vue-Toastification
+        toast = page.locator(".Vue-Toastification__toast-body, .v-snackbar__content").first
+        if await toast.count() > 0:
+            t = await toast.inner_text()
+            if t and t.strip():
+                return t.strip()
+
+        # رسائل v-messages
+        err = page.locator(".v-messages__message, .v-input__details").first
+        if await err.count() > 0:
+            t = await err.inner_text()
+            if t and t.strip() and len(t.strip()) > 3:
+                return t.strip()
+    except Exception as e:
+        log.warning("find_error_message failed: %s", e)
+    return None
+
+
+async def wait_for_login_result(page, timeout_ms: int = 90000) -> dict:
+    """
+    يستنى حتى تكتمل العملية:
+    - يختفي spinner
+    - يتغير URL
+    - أو تظهر رسالة خطأ
+    يرجع dict فيه:
+      - status: 'success' | 'error' | 'timeout'
+      - error: نص الخطأ إن وجد
+      - url: URL النهائي
+    """
+    result = {"status": "timeout", "error": None, "url": page.url}
+    start = asyncio.get_event_loop().time()
+    timeout_s = timeout_ms / 1000.0
+
+    while (asyncio.get_event_loop().time() - start) < timeout_s:
+        # 1) نجحنا؟
+        if await is_logged_in(page):
+            result["status"] = "success"
+            result["url"] = page.url
+            return result
+
+        # 2) كاين خطأ؟
+        err = await find_error_message(page)
+        if err:
+            result["status"] = "error"
+            result["error"] = err
+            result["url"] = page.url
+            return result
+
+        # 3) كاين spinner نشط؟
+        try:
+            spinner = page.locator(".v-overlay--active, .v-progress-circular--visible").first
+            spinner_active = await spinner.count() > 0
+        except Exception:
+            spinner_active = False
+
+        if not spinner_active:
+            # نتأكدو مرة أخرى
+            await page.wait_for_timeout(1500)
+            if await is_logged_in(page):
+                result["status"] = "success"
+                result["url"] = page.url
+                return result
+            err = await find_error_message(page)
+            if err:
+                result["status"] = "error"
+                result["error"] = err
+                result["url"] = page.url
+                return result
+
+        await page.wait_for_timeout(1000)
+
+    result["url"] = page.url
+    return result
+
+
 # ================== Extraction ==================
 async def extract_balance(page) -> str | None:
     try:
@@ -178,64 +279,51 @@ async def extract_balance(page) -> str | None:
 
 
 async def is_logged_in(page) -> bool:
+    """دخلنا إذا ماشين في /sign-in و/أو حقل كلمة السر ما بقاش ظاهر"""
     try:
-        if "/sign-in" in page.url or "/login" in page.url:
+        url = page.url
+        if "/sign-in" in url or "/login" in url:
+            # لكن نتأكدو بلي الحقل ماشي ظاهر
             if await page.locator("input[type='password']").count() > 0:
                 return False
+            # ممكن الصفحة في transition
+            return False
+        # إذا ماشي في sign-in، على الأغلب دخلنا
+        return True
     except Exception:
-        pass
-    return True
+        return False
 
 
 # ================== Hide overlays ==================
-async def hide_overlays(page):
+async def hide_overlays(page, keep_spinner: bool = False):
     try:
-        await page.evaluate("""
-            () => {
+        js = """
+            (keepSpinner) => {
                 const selectors = [
-                    '.v-overlay', '.v-overlay__scrim',
                     '.swiper', '.swiper-wrapper', '.swiper-slide',
                     '.cookie-banner', '.cookie-consent', '.cc-window',
-                    '.modal', '.modal-backdrop',
                     '#onetrust-banner-sdk',
                     '.grecaptcha-badge',
-                    '.v-snackbar', '.v-snackbar__wrapper',
                 ];
+                if (!keepSpinner) {
+                    selectors.push('.v-overlay__scrim');
+                }
                 for (const sel of selectors) {
                     document.querySelectorAll(sel).forEach(el => {
                         el.style.display = 'none';
                         el.style.pointerEvents = 'none';
                     });
                 }
-                document.querySelectorAll('*').forEach(el => {
-                    const s = getComputedStyle(el);
-                    if ((s.position === 'fixed' || s.position === 'absolute') &&
-                        el.offsetWidth > 200 && el.offsetHeight > 100) {
-                        const r = el.getBoundingClientRect();
-                        if (r.top < 900 && r.left < 500 && r.height > 200) {
-                            el.style.display = 'none';
-                        }
-                    }
-                });
             }
-        """)
-        log.info("Overlays hidden")
+        """
+        await page.evaluate(js, keep_spinner)
+        log.info("Overlays hidden (keepSpinner=%s)", keep_spinner)
     except Exception as e:
         log.warning("hide_overlays failed: %s", e)
 
 
-# ================== Phone variant — صيغة واحدة فقط ==================
-def phone_variants(raw: str) -> list[str]:
-    """صيغة واحدة فقط — كما كتبها المستخدم"""
-    raw = (raw or "").strip()
-    if not raw:
-        return []
-    return [raw]
-
-
-# ================== Vue-friendly fill ==================
+# ================== Fill helpers ==================
 async def fill_username(page, username: str) -> bool:
-    # JS مباشر — بلا click
     try:
         found = await page.evaluate("""
             (val) => {
@@ -255,13 +343,11 @@ async def fill_username(page, username: str) -> bool:
                 if (!target) {
                     const inputs = [...document.querySelectorAll('input')].filter(i => {
                         const t = i.type || 'text';
-                        return t !== 'password' && t !== 'hidden' &&
-                               i.offsetParent !== null;
+                        return t !== 'password' && t !== 'hidden' && i.offsetParent !== null;
                     });
                     if (inputs.length > 0) target = inputs[0];
                 }
                 if (!target) return false;
-
                 target.focus();
                 const setter = Object.getOwnPropertyDescriptor(
                     window.HTMLInputElement.prototype, 'value'
@@ -280,7 +366,6 @@ async def fill_username(page, username: str) -> bool:
     except Exception as e:
         log.warning("JS username failed: %s", e)
 
-    # fallback force
     try:
         xp = "xpath=//label[contains(., \"Nom d'utilisateur\")]/following::input[1]"
         inp = page.locator(xp).first
@@ -294,7 +379,6 @@ async def fill_username(page, username: str) -> bool:
             return True
     except Exception as e:
         log.warning("label force failed: %s", e)
-
     return False
 
 
@@ -376,6 +460,43 @@ async def click_connexion(page) -> bool:
 
 
 # ================== Main flow ==================
+async def attempt_login(page, phone: str, password: str, attempt_num: int) -> dict:
+    """محاولة واحدة دخول. يرجع {'status', 'error', 'url'}"""
+    log.info("=== Attempt %d ===", attempt_num)
+    await notify(f"🔁 محاولة {attempt_num}/{MAX_LOGIN_ATTEMPTS}")
+
+    # نروحو لصفحة sign-in من جديد
+    await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(5000)
+    await hide_overlays(page)
+
+    # نعبّيو الحقول
+    if not await fill_username(page, phone):
+        return {"status": "error", "error": "ما قدرناش نعبّيو اسم المستخدم", "url": page.url}
+
+    if not await fill_password(page, password):
+        return {"status": "error", "error": "ما قدرناش نعبّيو كلمة السر", "url": page.url}
+
+    await page.wait_for_timeout(1200)
+    await page.screenshot(path=f"before_login_attempt{attempt_num}.png", full_page=True)
+
+    # Connexion
+    if not await click_connexion(page):
+        return {"status": "error", "error": "ما لقيناش زر Connexion", "url": page.url}
+
+    log.info("Connexion clicked, waiting for result...")
+    await notify("⏳ جاري الانتظار حتى يكمل الدخول...")
+
+    # ننتظرو النتيجة (سلسلة كاملة)
+    result = await wait_for_login_result(page, timeout_ms=90000)
+    log.info("Result: %s", result)
+
+    # نصوّرو
+    await page.screenshot(path=f"after_attempt{attempt_num}.png", full_page=True)
+
+    return result
+
+
 async def login_and_get_balance(browser) -> str | None:
     # 1) جلسة محفوظة
     if STATE_FILE.exists():
@@ -414,100 +535,66 @@ async def login_and_get_balance(browser) -> str | None:
     page = await ctx.new_page()
 
     try:
-        log.info("Opening %s", SIGNIN_URL)
-        await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(6000)
-
-        try:
-            await page.wait_for_selector("input", timeout=15000)
-        except Exception:
-            pass
-
-        await hide_overlays(page)
-        await page.wait_for_timeout(500)
-
-        captcha = await detect_captcha(page)
-        if captcha:
-            await page.screenshot(path="captcha.png", full_page=True)
-            await send_photo("captcha.png", f"⚠️ كاين كابتشا: {captcha}")
-            await notify("⛔ نحتاجو أداة حل الكابتشا.")
-            await ctx.close()
-            return None
-
-        # نطلبو البيانات
+        # نطلب البيانات
         raw_phone = await ask_username()
         password = await ask_password()
 
-        variants = phone_variants(raw_phone)
-        if not variants:
+        phone = (raw_phone or "").strip()
+        if not phone:
             await notify("❌ الرقم فارغ")
             await ctx.close()
             return None
 
-        phone = variants[0]
-        log.info("Using phone: %s", phone)
-        await notify(f"🔁 جاري الدخول بـ: <code>{phone}</code>")
-
-        # اسم المستخدم
-        if not await fill_username(page, phone):
-            await page.screenshot(path="fail_user.png", full_page=True)
-            await send_photo("fail_user.png", "❌ فشل تعبئة اسم المستخدم")
-            await ctx.close()
-            return None
-
-        # كلمة السر
-        if not await fill_password(page, password):
-            await page.screenshot(path="fail_pwd.png", full_page=True)
-            await send_photo("fail_pwd.png", "❌ فشل تعبئة كلمة السر")
-            await ctx.close()
-            return None
-
-        await page.wait_for_timeout(1500)
-        await page.screenshot(path="filled.png", full_page=True)
-        await send_photo("filled.png", "📸 الحقول معبّية")
-
-        # Connexion
-        if not await click_connexion(page):
-            await notify("❌ زر Connexion ما تلقاش")
-            await ctx.close()
-            return None
-
-        log.info("Clicked Connexion, waiting...")
-        await notify("⏳ جاري انتظار نتيجة الدخول...")
-
-        # ننتظرو مدة كافية
-        await page.wait_for_timeout(10000)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=30000)
-        except Exception:
-            pass
-        await page.wait_for_timeout(3000)
-
-        # نصوّرو النتيجة
-        await page.screenshot(path="after_login.png", full_page=True)
-        await send_photo("after_login.png", f"📸 بعد الدخول — URL: {page.url}")
-
-        # واش دخلنا؟
-        if not await is_logged_in(page):
-            await notify(f"❌ ما دخلناش. URL: <code>{page.url}</code>")
-
-            # نحفظو HTML والصفحة باش نحللو
+        # محاولات متعددة
+        last_error = None
+        for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
             try:
-                html = await page.content()
-                Path("after_login.html").write_text(html, encoding="utf-8")
-                await send_document("after_login.html", "after_login.html", "📄 HTML")
+                result = await attempt_login(page, phone, password, attempt)
             except Exception as e:
-                log.error("dump failed: %s", e)
+                log.exception("attempt %d crashed", attempt)
+                await notify(f"❌ خطأ في المحاولة {attempt}: <code>{e}</code>")
+                last_error = str(e)
+                continue
 
-            await ctx.close()
-            return None
+            status = result.get("status")
+            error = result.get("error")
 
-        # نجحنا! نحفظو الجلسة
+            if status == "success":
+                await notify("✅ دخلنا بنجاح!")
+                break
+
+            if status == "error":
+                last_error = error or "خطأ غير معروف"
+                await notify(f"⚠️ <b>خطأ:</b> <code>{last_error}</code>")
+                await page.screenshot(path=f"error_attempt{attempt}.png", full_page=True)
+                await send_photo(f"error_attempt{attempt}.png", f"❌ محاولة {attempt}: {last_error}")
+
+                if attempt < MAX_LOGIN_ATTEMPTS:
+                    await notify("🔄 نعاود المحاولة...")
+                    await page.wait_for_timeout(3000)
+                    continue
+                else:
+                    await notify(f"❌ فشلت {MAX_LOGIN_ATTEMPTS} محاولات. آخر خطأ: {last_error}")
+                    await ctx.close()
+                    return None
+
+            if status == "timeout":
+                await notify(f"⏰ انتهت مدة المحاولة {attempt} بلا نتيجة.")
+                if attempt < MAX_LOGIN_ATTEMPTS:
+                    await notify("🔄 نعاود...")
+                    await page.wait_for_timeout(3000)
+                    continue
+                else:
+                    await notify("❌ فشلت كل المحاولات (timeout)")
+                    await ctx.close()
+                    return None
+
+        # نحفظو الجلسة
         await ctx.storage_state(path=str(STATE_FILE))
         log.info("Session saved")
-        await notify("✅ دخلنا بنجاح! نحفظو الجلسة ونروحو للرصيد...")
 
         # نروحو للرصيد
+        await notify("✅ دخلنا. نجيب الرصيد...")
         await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=45000)
         await page.wait_for_timeout(9000)
         await hide_overlays(page)
