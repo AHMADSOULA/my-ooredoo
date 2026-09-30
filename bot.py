@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Bot - fixed screenshot timeout
+Ooredoo Bot - with Algerian proxy support
 """
 
 import os
@@ -26,6 +26,11 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 MIN_BALANCE = int(os.getenv("MIN_BALANCE", "100"))
 HEADLESS = False
 RETRY_DELAY = 3
+
+# ✅ Proxy
+PROXY_SERVER = os.getenv("PROXY_SERVER", "")
+PROXY_USERNAME = os.getenv("PROXY_USERNAME", "")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
 
 HOME_URL = "https://my.ooredoo.dz/"
 SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
@@ -153,6 +158,38 @@ def is_invalid_creds(text):
         "invalid email", "compte non trouvé", "compte introuvable",
         "utilisateur inconnu", "user not found", "account not found",
     ])
+
+
+# ============================================================
+#  ✅ Create context with proxy
+# ============================================================
+async def create_context(browser):
+    ctx_args = {
+        "locale": "fr-FR",
+        "viewport": {"width": 412, "height": 915},
+        "user_agent": ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"),
+        "ignore_https_errors": True,
+    }
+
+    if PROXY_SERVER:
+        proxy = {"server": PROXY_SERVER}
+        if PROXY_USERNAME:
+            proxy["username"] = PROXY_USERNAME
+        if PROXY_PASSWORD:
+            proxy["password"] = PROXY_PASSWORD
+        ctx_args["proxy"] = proxy
+        log_to_file(f"Using proxy: {PROXY_SERVER}")
+        print(f"🌍 Using proxy: {PROXY_SERVER}")
+
+    ctx = await browser.new_context(**ctx_args)
+
+    try:
+        await ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
+    except Exception:
+        pass
+
+    return ctx
 
 
 # ============================================================
@@ -303,20 +340,7 @@ async def run_otp_flow(app, chat_id, phone):
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
             ])
-        ctx = await browser.new_context(
-            locale="fr-FR",
-            viewport={"width": 412, "height": 915},
-            user_agent=("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"),
-            ignore_https_errors=True,
-        )
-
-        # ✅ نحذفو الخطوط باش ما يعلّقش screenshot
-        try:
-            await ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
-        except Exception:
-            pass
-
+        ctx = await create_context(browser)
         page = await ctx.new_page()
 
         try:
@@ -332,7 +356,6 @@ async def run_otp_flow(app, chat_id, phone):
             except Exception:
                 pass
 
-            # 📸 screenshot آمن
             if await safe_screenshot(page, "/tmp/otp_step1.png", True):
                 try:
                     with open("/tmp/otp_step1.png", "rb") as f:
@@ -371,7 +394,6 @@ async def run_otp_flow(app, chat_id, phone):
                 except Exception:
                     pass
 
-            # reCAPTCHA
             await bot.send_message(chat_id=chat_id,
                 text="🧩 نحل reCAPTCHA...", parse_mode="HTML")
             rc_ok = await inject_recaptcha_token(page)
@@ -384,7 +406,6 @@ async def run_otp_flow(app, chat_id, phone):
 
             await page.wait_for_timeout(500)
 
-            # نضغطو
             old_url = page.url
             clicked = False
             try:
@@ -413,14 +434,14 @@ async def run_otp_flow(app, chat_id, phone):
                     pass
 
             await bot.send_message(chat_id=chat_id,
-                text="⏳ <b>نستنو...</b> (60s)",
+                text="⏳ <b>نستنو...</b> (90s)",
                 parse_mode="HTML")
 
             page_changed = False
             otp_field_visible = False
             start_wait = time.time()
 
-            while time.time() - start_wait < 60:
+            while time.time() - start_wait < 90:
                 if page.url != old_url:
                     old_url = page.url
                     page_changed = True
@@ -467,7 +488,6 @@ async def run_otp_flow(app, chat_id, phone):
                 await bot.send_message(chat_id=chat_id,
                     text="⏰ ما تبدلتش", parse_mode="HTML")
 
-            # نطلب OTP
             loop = asyncio.get_event_loop()
             fut = loop.create_future()
             state["otp_waiting"] = True
@@ -491,7 +511,6 @@ async def run_otp_flow(app, chat_id, phone):
 
             log_to_file(f"OTP code: {otp_code}")
 
-            # نكتبو
             try:
                 inputs = await page.locator(
                     "input[type='tel'], input[type='number'], "
@@ -766,18 +785,7 @@ async def wait_for_result(page, timeout=60):
 
 
 async def try_account(browser, user, pwd, bot, chat_id):
-    ctx = await browser.new_context(
-        locale="fr-FR",
-        viewport={"width": 412, "height": 915},
-        user_agent=("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"),
-        ignore_https_errors=True,
-    )
-    try:
-        await ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
-    except Exception:
-        pass
-
+    ctx = await create_context(browser)
     page = await ctx.new_page()
     try:
         await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
