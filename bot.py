@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Bot
-- user:pass (ملف) → فحص عادي
-- رقم فقط → OTP flow (مع fill() صحيح)
+Ooredoo Bot with reCAPTCHA injection
 """
 
 import os
@@ -158,7 +156,102 @@ def is_invalid_creds(text):
 
 
 # ============================================================
-#  OTP Flow - v2 (fill + keyboard + JS)
+#  🧩 reCAPTCHA Enterprise Injection
+# ============================================================
+async def inject_recaptcha_token(page):
+    """يحل reCAPTCHA Enterprise Invisible قبل الضغط"""
+    try:
+        log_to_file("inject_recaptcha: starting")
+
+        site_key = await page.evaluate("""
+            () => {
+                const scripts = [...document.querySelectorAll('script[src]')];
+                for (const s of scripts) {
+                    const m = s.src.match(/[?&]render=([^&]+)/);
+                    if (m && m[1] !== 'explicit') return m[1];
+                }
+                const html = document.documentElement.innerHTML;
+                const m2 = html.match(/recaptcha\\/enterprise\\.js\\?render=([A-Za-z0-9_-]+)/);
+                return m2 ? m2[1] : null;
+            }
+        """)
+        log_to_file(f"site_key: {site_key}")
+
+        if not site_key:
+            log_to_file("no site_key", "WARN")
+            return False
+
+        # نستنو grecaptcha
+        for _ in range(40):
+            ok = await page.evaluate(
+                "() => !!(window.grecaptcha && window.grecaptcha.enterprise)"
+            )
+            if ok:
+                break
+            await asyncio.sleep(0.5)
+
+        log_to_file("grecaptcha loaded")
+
+        # نستدعيو execute
+        token = await page.evaluate("""
+            async (siteKey) => {
+                return new Promise((resolve) => {
+                    try {
+                        window.grecaptcha.enterprise.ready(async () => {
+                            try {
+                                const t = await window.grecaptcha.enterprise.execute(
+                                    siteKey,
+                                    {action: 'login'}
+                                );
+                                resolve(t);
+                            } catch (e) {
+                                resolve('ERR:' + e.message);
+                            }
+                        });
+                    } catch (e) {
+                        resolve('ERR:' + e.message);
+                    }
+                    setTimeout(() => resolve('TIMEOUT'), 30000);
+                });
+            }
+        """, site_key)
+
+        log_to_file(f"recaptcha token: {str(token)[:50]}")
+
+        if not token or str(token).startswith("ERR") or token == "TIMEOUT":
+            log_to_file(f"token failed: {token}", "ERROR")
+            return False
+
+        await page.evaluate("""
+            (t) => {
+                let ta = document.querySelector(
+                    "textarea[name='g-recaptcha-response']"
+                );
+                if (!ta) {
+                    ta = document.createElement('textarea');
+                    ta.name = 'g-recaptcha-response';
+                    ta.id = 'g-recaptcha-response';
+                    ta.style.display = 'none';
+                    document.body.appendChild(ta);
+                }
+                ta.value = t;
+                ta.textContent = t;
+                ta.dispatchEvent(new Event('input',  {bubbles: true}));
+                ta.dispatchEvent(new Event('change', {bubbles: true}));
+                return ta.value === t;
+            }
+        """, token)
+
+        log_to_file("token injected ✅")
+        return True
+
+    except Exception as e:
+        log_to_file(f"inject_recaptcha error: {e}", "ERROR")
+        return False
+
+
+# ============================================================
+#  OTP Flow
 # ============================================================
 async def run_otp_flow(app, chat_id, phone):
     bot = app.bot
@@ -184,24 +277,18 @@ async def run_otp_flow(app, chat_id, phone):
             await bot.send_message(chat_id=chat_id, text="🌐 نفتحو الصفحة...")
             await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(5000)
-            log_to_file(f"Loaded {page.url}")
 
             try:
                 await page.wait_for_selector("input[placeholder*='05'], input[type='number']", timeout=15000)
-                log_to_file("Input found")
-            except Exception as e:
-                log_to_file(f"Input not found: {e}", "WARN")
+            except Exception:
+                pass
 
-            # 📸 الصفحة الأولى
             await page.screenshot(path="/tmp/otp_step1.png", full_page=True)
             with open("/tmp/otp_step1.png", "rb") as f:
                 await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption="📸 الصفحة الرئيسية", parse_mode="HTML")
+                    caption="📸 الصفحة", parse_mode="HTML")
 
-            # ✅ كتابة الرقم — 3 طرق
-            ok = False
-
-            # طريقة 1: fill()
+            # ✅ كتابة الرقم بـ fill()
             try:
                 loc = page.locator("input[aria-label='Ooredoo mobile number']").first
                 if await loc.count() == 0:
@@ -219,114 +306,32 @@ async def run_otp_flow(app, chat_id, phone):
                     await page.wait_for_timeout(500)
                     val = await loc.input_value()
                     log_to_file(f"fill() value: '{val}'")
-
-                    btn_disabled = await page.evaluate("""
-                        () => {
-                            const btns = [...document.querySelectorAll('button')];
-                            const t = btns.find(b => /acc[ée]der/i.test(b.textContent || ''));
-                            return t ? t.disabled : null;
-                        }
-                    """)
-                    log_to_file(f"Btn disabled after fill: {btn_disabled}")
-
-                    if val == phone:
-                        ok = True
+                    if val != phone:
+                        log_to_file("fill failed", "ERROR")
             except Exception as e:
-                log_to_file(f"fill() failed: {e}", "ERROR")
+                log_to_file(f"fill error: {e}", "ERROR")
 
-            # طريقة 2: keyboard.type()
-            if not ok:
-                try:
-                    loc = page.locator("input[type='number'], input[inputmode='tel']").first
-                    if await loc.count() > 0:
-                        await loc.click(timeout=5000)
-                        await page.wait_for_timeout(200)
-                        await loc.fill("")
-                        await page.wait_for_timeout(100)
-                        await page.keyboard.type(phone, delay=100)
-                        await page.wait_for_timeout(500)
-                        val = await loc.input_value()
-                        if val == phone:
-                            ok = True
-                            log_to_file("Filled via type()")
-                except Exception as e:
-                    log_to_file(f"type failed: {e}", "ERROR")
-
-            # طريقة 3: JS events
-            if not ok:
-                try:
-                    done = await page.evaluate("""
-                        (val) => {
-                            const inp = document.querySelector("input[aria-label='Ooredoo mobile number']")
-                                || document.querySelector("input[type='number']");
-                            if (!inp) return false;
-                            inp.focus();
-                            const setter = Object.getOwnPropertyDescriptor(
-                                window.HTMLInputElement.prototype, 'value'
-                            ).set;
-                            setter.call(inp, val);
-                            inp.dispatchEvent(new Event('input',  {bubbles: true}));
-                            inp.dispatchEvent(new Event('change', {bubbles: true}));
-                            inp.dispatchEvent(new Event('blur',   {bubbles: true}));
-                            inp.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
-                            return inp.value === val;
-                        }
-                    """, phone)
-                    if done:
-                        ok = True
-                        log_to_file("Filled via JS")
-                except Exception as e:
-                    log_to_file(f"JS failed: {e}", "ERROR")
-
-            if not ok:
-                await bot.send_message(chat_id=chat_id, text="❌ ما قدرناش نكتبو الرقم")
-                try:
-                    with open(LOG_FILE, "rb") as f:
-                        await bot.send_document(chat_id=chat_id, document=f,
-                            filename="bot.log", caption="📋 Logs")
-                except Exception:
-                    pass
-                await browser.close()
-                return
-
-            # 📸 بعد الكتابة
             await page.screenshot(path="/tmp/otp_step2.png", full_page=True)
             with open("/tmp/otp_step2.png", "rb") as f:
                 await bot.send_photo(chat_id=chat_id, photo=f,
                     caption=f"📸 بعد كتابة <code>{phone}</code>",
                     parse_mode="HTML")
 
-            # زر — نتحققو + نضغطو
+            # ✅ نحلو reCAPTCHA قبل الضغط
+            await bot.send_message(chat_id=chat_id,
+                text="🧩 نحل reCAPTCHA...", parse_mode="HTML")
+            rc_ok = await inject_recaptcha_token(page)
+            if rc_ok:
+                await bot.send_message(chat_id=chat_id,
+                    text="✅ reCAPTCHA جاهز", parse_mode="HTML")
+            else:
+                await bot.send_message(chat_id=chat_id,
+                    text="⚠️ reCAPTCHA فشل — نكمل", parse_mode="HTML")
+
+            await page.wait_for_timeout(500)
+
+            # نضغطو الزر
             old_url = page.url
-            btn_state = await page.evaluate("""
-                () => {
-                    const btns = [...document.querySelectorAll('button')];
-                    const t = btns.find(b => /acc[ée]der/i.test(b.textContent || ''));
-                    if (!t) return null;
-                    return {
-                        disabled: t.disabled,
-                        text: (t.textContent || '').trim(),
-                    };
-                }
-            """)
-            log_to_file(f"Btn state: {btn_state}")
-
-            if btn_state and btn_state.get("disabled"):
-                log_to_file("Force enabling btn")
-                await page.evaluate("""
-                    () => {
-                        const btns = [...document.querySelectorAll('button')];
-                        const t = btns.find(b => /acc[ée]der/i.test(b.textContent || ''));
-                        if (t) {
-                            t.removeAttribute('disabled');
-                            t.disabled = false;
-                            t.classList.remove('v-btn--disabled');
-                        }
-                    }
-                """)
-                await page.wait_for_timeout(300)
-
-            # نضغطو
             clicked = False
             try:
                 btn = page.get_by_role("button",
@@ -366,7 +371,7 @@ async def run_otp_flow(app, chat_id, phone):
                 await browser.close()
                 return
 
-            # نستنو الصفحة تتبدل
+            # نستنو
             await bot.send_message(chat_id=chat_id,
                 text="⏳ <b>نستنو الصفحة تتبدل...</b> (60s)",
                 parse_mode="HTML")
@@ -374,7 +379,6 @@ async def run_otp_flow(app, chat_id, phone):
             page_changed = False
             otp_field_visible = False
             start_wait = time.time()
-            last_check = 0
 
             while time.time() - start_wait < 60:
                 current_url = page.url
@@ -405,42 +409,16 @@ async def run_otp_flow(app, chat_id, phone):
                 except Exception:
                     pass
 
-                if time.time() - last_check > 10:
-                    log_to_file(f"waiting... url={current_url}")
-                    last_check = time.time()
-
                 await asyncio.sleep(1)
 
             if page_changed or otp_field_visible:
                 await bot.send_message(chat_id=chat_id,
-                    text=(f"✅ <b>الصفحة تبدلت!</b>\nURL: <code>{page.url}</code>\n"
-                          f"حقل OTP: {'✅' if otp_field_visible else '⚠️'}"),
+                    text=(f"✅ <b>الصفحة تبدلت!</b>\nURL: <code>{page.url}</code>"),
                     parse_mode="HTML")
             else:
-                # ما تبدلتش → نبعثو التفاصيل
                 await bot.send_message(chat_id=chat_id,
                     text="⏰ <b>الصفحة ما تبدلتش</b>\n📄 نبعثلك التشخيص...",
                     parse_mode="HTML")
-
-                try:
-                    log_to_file("=" * 60)
-                    log_to_file("OTP FAILED - no change")
-                    log_to_file(f"URL: {page.url}")
-                    btn_info = await page.evaluate("""
-                        () => {
-                            const btns = [...document.querySelectorAll('button')];
-                            return btns.map(b => ({
-                                text: (b.textContent || '').trim().slice(0, 60),
-                                disabled: b.disabled,
-                            }));
-                        }
-                    """)
-                    log_to_file(f"Buttons: {btn_info}")
-                    inp_val = await page.locator("input").first.input_value()
-                    log_to_file(f"Input value: '{inp_val}'")
-                    log_to_file("=" * 60)
-                except Exception as e:
-                    log_to_file(f"dump: {e}", "ERROR")
 
                 try:
                     html = await page.content()
@@ -465,13 +443,6 @@ async def run_otp_flow(app, chat_id, phone):
                     with open("/tmp/otp_fail.html", "rb") as f:
                         await bot.send_document(chat_id=chat_id, document=f,
                             filename="otp_fail.html", caption="📄 HTML")
-                except Exception:
-                    pass
-
-                try:
-                    with open("/tmp/otp_fail.png", "rb") as f:
-                        await bot.send_photo(chat_id=chat_id, photo=f,
-                            caption="📸 صورة")
                 except Exception:
                     pass
 
@@ -506,6 +477,7 @@ async def run_otp_flow(app, chat_id, phone):
 
             log_to_file(f"OTP code: {otp_code}")
 
+            # نكتبو
             try:
                 inputs = await page.locator(
                     "input[type='tel'], input[type='number'], "
@@ -533,6 +505,7 @@ async def run_otp_flow(app, chat_id, phone):
                     caption=f"📸 بعد كتابة <code>{otp_code}</code>",
                     parse_mode="HTML")
 
+            # نضغطو زر التحقق
             try:
                 btn = page.get_by_role("button",
                     name=re.compile("valider|v[ée]rifier|confirmer|suivant|continuer", re.I))
@@ -601,7 +574,7 @@ async def run_otp_flow(app, chat_id, phone):
 
 
 # ============================================================
-#  Username Flow (كما هو)
+#  Username Flow (كما هو من قبل)
 # ============================================================
 async def wait_page_ready(page, timeout=30):
     start = time.time()
