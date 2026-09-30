@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Railway Bot - keyboard typing version
+Ooredoo Railway Bot - tries variants forever until login
 """
 
 import os
@@ -27,8 +27,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 MIN_BALANCE = int(os.getenv("MIN_BALANCE", "100"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-RETRY_DELAY = 3
-MAX_RETRY = 10
+RETRY_DELAY = 5        # ⚡ بلا حدود
+MAX_RETRY = 999        # 🔄 نعاودو للأبد
 
 SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
 
@@ -168,9 +168,6 @@ async def wait_page_ready(page, timeout=30):
     return False
 
 
-# ============================================================
-#  تعبئة الحقول — keyboard typing (الأفضل)
-# ============================================================
 async def fill_username(page, username):
     log_to_file(f"fill_username: {username}")
     try:
@@ -178,26 +175,22 @@ async def fill_username(page, username):
         if await loc.count() == 0:
             loc = page.locator("input[type='text']").first
         if await loc.count() == 0:
-            log_to_file("  no input", "ERROR")
             return False
 
         await loc.scroll_into_view_if_needed()
         await loc.click(timeout=5000)
         await page.wait_for_timeout(200)
 
-        # نمسحو
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Delete")
         await page.wait_for_timeout(100)
 
-        # ✅ نكتبو بالكيبورد
         await page.keyboard.type(username, delay=80)
         await page.wait_for_timeout(300)
 
         val = await loc.input_value()
-        log_to_file(f"  after type: '{val}'")
+        log_to_file(f"  after: '{val}'")
         if val == username:
-            log_to_file("  SUCCESS")
             return True
     except Exception as e:
         log_to_file(f"  failed: {e}", "ERROR")
@@ -205,11 +198,9 @@ async def fill_username(page, username):
 
 
 async def fill_password(page, password):
-    log_to_file("fill_password")
     try:
         loc = page.locator("input[type='password']").first
         if await loc.count() == 0:
-            log_to_file("  no input", "ERROR")
             return False
 
         await loc.scroll_into_view_if_needed()
@@ -224,39 +215,31 @@ async def fill_password(page, password):
         await page.wait_for_timeout(300)
 
         val = await loc.input_value()
-        log_to_file(f"  after type: len={len(val or '')}")
         if val == password:
-            log_to_file("  SUCCESS")
             return True
     except Exception as e:
-        log_to_file(f"  failed: {e}", "ERROR")
+        log_to_file(f"  pwd failed: {e}", "ERROR")
     return False
 
 
 async def click_connexion(page):
-    log_to_file("click_connexion")
     try:
         btn = page.get_by_role("button", name=re.compile("connexion", re.I))
-        cnt = await btn.count()
-        log_to_file(f"  count: {cnt}")
-        if cnt > 0:
+        if await btn.count() > 0:
             el = btn.first
             for i in range(20):
                 d = await el.get_attribute("disabled")
                 if d is None:
-                    log_to_file(f"  enabled after {i*0.5}s")
                     break
                 await asyncio.sleep(0.5)
             try:
                 await el.click(timeout=5000)
-                log_to_file("  clicked")
                 return True
             except Exception:
                 await el.click(force=True)
-                log_to_file("  clicked force")
                 return True
     except Exception as e:
-        log_to_file(f"  role failed: {e}", "ERROR")
+        log_to_file(f"  click failed: {e}", "ERROR")
 
     try:
         ok = await page.evaluate("""
@@ -272,10 +255,9 @@ async def click_connexion(page):
             }
         """)
         if ok:
-            log_to_file("  clicked JS")
             return True
-    except Exception as e:
-        log_to_file(f"  JS failed: {e}", "ERROR")
+    except Exception:
+        pass
     return False
 
 
@@ -363,6 +345,7 @@ async def wait_for_result(page, timeout=45):
 
 
 async def try_account(browser, user, pwd, bot, chat_id):
+    """يجرب 3 صيغ للرقم"""
     ctx = await browser.new_context(
         locale="fr-FR",
         viewport={"width": 412, "height": 915},
@@ -372,7 +355,6 @@ async def try_account(browser, user, pwd, bot, chat_id):
     page = await ctx.new_page()
 
     try:
-        log_to_file(f"Opening for {user}")
         await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
 
         if not await wait_page_ready(page, timeout=30):
@@ -381,87 +363,92 @@ async def try_account(browser, user, pwd, bot, chat_id):
 
         await page.wait_for_timeout(500)
 
-        if not await fill_username(page, user):
-            log_to_file("FAIL username", "ERROR")
-            await page.screenshot(path="/tmp/fill_fail.png", full_page=True)
-            try:
-                with open("/tmp/fill_fail.png", "rb") as f:
-                    await bot.send_photo(chat_id=chat_id, photo=f,
-                                          caption=f"❌ اسم المستخدم: {user}")
-            except Exception:
-                pass
-            await ctx.close()
-            return {"status": "error", "msg": "fill_username failed", "stop": True}
+        # صيغ الرقم
+        digits = re.sub(r"\D", "", user)
+        variants = [user]
+        if digits.startswith("0") and len(digits) >= 10:
+            local = digits[1:]
+            variants.append(f"213{local}")
+            variants.append(f"+213{local}")
+        # نحذفو التكرار
+        seen = set()
+        variants = [v for v in variants if not (v in seen or seen.add(v))]
 
-        await page.wait_for_timeout(300)
+        log_to_file(f"Variants: {variants}")
 
-        if not await fill_password(page, pwd):
-            log_to_file("FAIL password", "ERROR")
-            await ctx.close()
-            return {"status": "error", "msg": "fill_password failed", "stop": True}
-
-        await page.wait_for_timeout(800)
-        await page.screenshot(path="/tmp/before.png", full_page=False)
-        try:
-            with open("/tmp/before.png", "rb") as f:
-                await bot.send_photo(chat_id=chat_id, photo=f,
-                                      caption=f"📸 قبل الضغط: {user}")
-        except Exception:
-            pass
-
-        if not await click_connexion(page):
-            log_to_file("FAIL click", "ERROR")
-            await page.screenshot(path="/tmp/no_btn.png", full_page=False)
-            try:
-                with open("/tmp/no_btn.png", "rb") as f:
-                    await bot.send_photo(chat_id=chat_id, photo=f,
-                                          caption=f"❌ زر: {user}")
-            except Exception:
-                pass
-            await ctx.close()
-            return {"status": "error", "msg": "no button", "stop": True}
-
-        log_to_file("Clicked")
-        result = await wait_for_result(page, timeout=45)
-        log_to_file(f"Result: {result}")
-
-        await page.screenshot(path="/tmp/after.png", full_page=False)
-
-        if result["status"] == "success":
-            await page.wait_for_timeout(2000)
-            body = await page.inner_text("body")
-            bal = find_balance_in_text(body)
-            await ctx.close()
-            return {"status": "success", "balance": bal}
-
-        if result["status"] == "error":
-            err = result["error"]
-            try:
-                with open("/tmp/after.png", "rb") as f:
-                    await bot.send_photo(chat_id=chat_id, photo=f,
-                        caption=(f"🛑 <b>خطأ!</b>\n"
-                                 f"الحساب: <code>{user}</code>\n"
-                                 f"الخطأ: <code>{err}</code>"),
-                        parse_mode="HTML")
-            except Exception:
-                pass
-
-            if is_invalid_creds(err):
+        for variant in variants:
+            if state["stop"]:
                 await ctx.close()
-                return {"status": "invalid", "msg": err}
-            await ctx.close()
-            return {"status": "error", "msg": err, "stop": True}
+                return {"status": "retry", "msg": "stopped"}
+
+            # نرجعو للصفحة إذا كان مختلف
+            if "/sign-in" not in page.url:
+                await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(2000)
+                await wait_page_ready(page, timeout=15)
+
+            log_to_file(f"  Variant: {variant}")
+
+            # نمسحو
+            try:
+                await page.evaluate("""
+                    () => {
+                        document.querySelectorAll('input').forEach(inp => {
+                            if (inp.type === 'text' || inp.type === 'password') {
+                                inp.value = '';
+                            }
+                        });
+                    }
+                """)
+                await page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+            if not await fill_username(page, variant):
+                log_to_file(f"  FAIL username")
+                continue
+
+            await page.wait_for_timeout(200)
+
+            if not await fill_password(page, pwd):
+                log_to_file(f"  FAIL password")
+                continue
+
+            await page.wait_for_timeout(500)
+
+            if not await click_connexion(page):
+                log_to_file(f"  FAIL click")
+                continue
+
+            result = await wait_for_result(page, timeout=30)
+            log_to_file(f"  Result: {result}")
+
+            if result["status"] == "success":
+                await page.wait_for_timeout(2000)
+                body = await page.inner_text("body")
+                bal = find_balance_in_text(body)
+                await ctx.close()
+                return {"status": "success", "balance": bal}
+
+            if result["status"] == "error":
+                err = result["error"]
+                if is_invalid_creds(err):
+                    continue
+                await ctx.close()
+                return {"status": "error", "msg": err, "stop": True}
+
+            # timeout → الصيغة التالية
 
         await ctx.close()
-        return {"status": "error", "msg": "timeout", "stop": True}
+        return {"status": "invalid", "msg": "all variants failed"}
 
     except Exception as e:
-        log_to_file(f"exception: {e}", "ERROR")
+        log_to_file(f"try_account exception: {e}", "ERROR")
         try:
             await ctx.close()
         except Exception:
             pass
-        return {"status": "error", "msg": str(e), "stop": True}
+        return {"status": "retry", "msg": str(e)}
 
 
 async def run_check(app, chat_id, accounts):
@@ -472,32 +459,39 @@ async def run_check(app, chat_id, accounts):
 
     await bot.send_message(chat_id=chat_id,
         text=(f"🚀 <b>بداية</b>\nعدد: <b>{len(accounts)}</b>\n"
-              f"الحد: <b>{MIN_BALANCE}</b> دج"),
+              f"الحد: <b>{MIN_BALANCE}</b> دج\n"
+              f"🔄 يعاود للأبد حتى يدخل."),
         parse_mode="HTML")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
         try:
-            last_update = time.time()
             for idx, (user, pwd) in enumerate(accounts, 1):
                 if state["stop"]:
                     await bot.send_message(chat_id=chat_id, text="⏹️ توقف.")
                     break
 
+                await bot.send_message(chat_id=chat_id,
+                    text=f"🔄 [{idx}/{len(accounts)}] نبداو <code>{user}</code>",
+                    parse_mode="HTML")
+
+                last_notify = time.time()
                 attempts = 0
+
+                # 🔄 نحاولو بلا حدود
                 while attempts < MAX_RETRY:
-                    attempts += 1
                     if state["stop"]:
                         break
+                    attempts += 1
+
                     try:
                         r = await try_account(browser, user, pwd, bot, chat_id)
                     except Exception:
-                        r = {"status": "error", "msg": "exception", "stop": True}
+                        r = {"status": "retry", "msg": "exception"}
 
                     if r.get("stop"):
                         stats.errors += 1
-                        stats.done += 1
                         await bot.send_message(chat_id=chat_id,
                             text=f"🛑 <b>توقف</b>\nالسبب: <code>{r.get('msg')}</code>",
                             parse_mode="HTML")
@@ -506,6 +500,7 @@ async def run_check(app, chat_id, accounts):
 
                     if r["status"] == "success":
                         stats.success += 1
+                        stats.done += 1
                         bal = r.get("balance")
                         if bal is None:
                             stats.no_balance += 1
@@ -518,30 +513,31 @@ async def run_check(app, chat_id, accounts):
                                       f"🔑 <code>{pwd}</code>\n"
                                       f"💵 <b>{bal}</b> دج"),
                                 parse_mode="HTML")
+                        else:
+                            await bot.send_message(chat_id=chat_id,
+                                text=f"✅ دخل {user} | رصيد: {bal} دج",
+                                parse_mode="HTML")
                         break
 
+                    # invalid أو retry → نعاودو
+                    stats.retries += 1
                     if r["status"] == "invalid":
                         stats.invalid += 1
-                        break
 
-                    stats.retries += 1
+                    # إشعار كل دقيقة
+                    if time.time() - last_notify > 60:
+                        await bot.send_message(chat_id=chat_id,
+                            text=(f"🔄 {user}\n"
+                                  f"محاولات: {attempts}\n"
+                                  f"السبب: <code>{r.get('msg', 'invalid')}</code>"),
+                            parse_mode="HTML")
+                        last_notify = time.time()
+
                     await asyncio.sleep(RETRY_DELAY)
-
-                stats.done += 1
 
                 if state["stop"]:
                     break
 
-                if time.time() - last_update > 15:
-                    try:
-                        await bot.send_message(chat_id=chat_id,
-                            text=(f"⏳ {idx}/{len(accounts)}\n"
-                                  f"✅ {stats.success} | 💰 {stats.hit} | "
-                                  f"❌ {stats.invalid} | 🛑 {stats.errors}"),
-                            parse_mode="HTML")
-                    except Exception:
-                        pass
-                    last_update = time.time()
         finally:
             await browser.close()
 
@@ -558,7 +554,9 @@ async def run_check(app, chat_id, accounts):
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 بوت Ooredoo\n\nابعتلي ملف accounts.txt\n/start /status /stop /log",
+        "🚀 بوت Ooredoo\n\nابعتلي ملف accounts.txt\n"
+        "🔄 يعاود للأبد حتى يدخل\n\n"
+        "/start /status /stop /log",
         parse_mode="HTML")
 
 
@@ -566,7 +564,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state["running"]:
         s = state["stats"]
         await update.message.reply_text(
-            f"⏳ {s.done}/{s.total}\n✅ {s.success} | 💰 {s.hit} | ❌ {s.invalid}",
+            f"⏳ {s.done}/{s.total}\n"
+            f"✅ {s.success} | 💰 {s.hit} | ❌ {s.invalid} | 🔄 {s.retries}",
             parse_mode="HTML")
     else:
         await update.message.reply_text("✅ جاهز.")
@@ -583,7 +582,7 @@ async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["stop"] = True
-    await update.message.reply_text("⏹️")
+    await update.message.reply_text("⏹️ جاري الإيقاف...")
 
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -605,7 +604,8 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["running"] = True
     state["stop"] = False
     await update.message.reply_text(
-        f"📄 {len(accounts)} حساب. نبداو...", parse_mode="HTML")
+        f"📄 {len(accounts)} حساب.\n🔄 نعاودو حتى ندخلو...",
+        parse_mode="HTML")
     asyncio.create_task(run_check(ctx.application, update.effective_chat.id, accounts))
 
 
