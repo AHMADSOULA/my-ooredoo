@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Railway Bot - with SCTG Captcha Solver
+Ooredoo Railway Bot
+- Playwright browser
+- Telegram interface
+- Manual captcha solving via Telegram (sends screenshot)
 """
 
 import os
 import re
 import sys
 import time
-import json
-import base64
 import asyncio
 import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes,
@@ -34,14 +35,9 @@ MIN_BALANCE = int(os.getenv("MIN_BALANCE", "100"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 RETRY_DELAY = 3
 MAX_RETRY = 10
-
-# SCTG API
-SCTG_API_KEY = os.getenv("SCTG_API_KEY", "Uosbi2t23tLFF7D1ro9yyX1EOJ61ER8I")
-SCTG_SUBMIT = "https://api.sctg.xyz/in.php"
-SCTG_RESULT = "https://api.sctg.xyz/res.php"
+CAPTCHA_TIMEOUT = 300  # 5 دقائق
 
 SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
-DASHBOARD_URL = "https://my.ooredoo.dz/dashboard/my-ooredoo"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +50,7 @@ log = logging.getLogger("ooredoo")
 #  📊 الحالة
 # ============================================================
 state = {"running": False, "stop": False, "stats": None}
+CAPTCHA_WAIT = {"future": None, "chat_id": None}
 
 
 class Stats:
@@ -167,128 +164,164 @@ def is_retryable(text):
 
 
 # ============================================================
-#  🧩 SCTG Captcha Solver
+#  🧩 كشف الكابتشا
 # ============================================================
-async def solve_recaptcha_sctg(page, bot, chat_id):
-    """يحل reCAPTCHA Enterprise Invisible عبر SCTG API"""
-    import httpx
+async def detect_captcha(page):
+    # 1) صورة كابتشا
+    for sel in [
+        "img[src*='captcha' i]",
+        "img[id*='captcha' i]",
+        "img[alt*='captcha' i]",
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                return {"type": "image", "locator": loc, "selector": sel}
+        except Exception:
+            continue
 
+    # 2) input نصي
+    for sel in [
+        "input[name='ca']",
+        "input[id='ca']",
+        "input[name*='captcha' i]",
+        "input[id*='captcha' i]",
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                return {"type": "input", "locator": loc, "selector": sel}
+        except Exception:
+            continue
+
+    # 3) reCAPTCHA v2
     try:
-        site_key = await page.evaluate("""
+        v2 = page.locator("iframe[src*='google.com/recaptcha/api2/anchor']").first
+        if await v2.count() > 0:
+            box = await v2.bounding_box()
+            if box and box["width"] > 0:
+                site_key = await page.evaluate("""
+                    () => {
+                        const ifr = document.querySelector("iframe[src*='recaptcha/api2/anchor']");
+                        if (!ifr) return null;
+                        const m = ifr.src.match(/[?&]k=([^&]+)/);
+                        return m ? m[1] : null;
+                    }
+                """)
+                return {"type": "recaptcha_v2", "sitekey": site_key}
+    except Exception:
+        pass
+
+    # 4) reCAPTCHA Enterprise (invisible)
+    try:
+        ent = await page.evaluate("""
             () => {
                 const scripts = [...document.querySelectorAll('script[src]')];
                 for (const s of scripts) {
                     const m = s.src.match(/[?&]render=([^&]+)/);
                     if (m && m[1] !== 'explicit') return m[1];
                 }
-                const iframes = [...document.querySelectorAll("iframe[src*='recaptcha']")];
-                for (const f of iframes) {
-                    const m = f.src.match(/[?&]k=([^&]+)/);
-                    if (m) return m[1];
-                }
                 const html = document.documentElement.innerHTML;
                 const m2 = html.match(/recaptcha\\/enterprise\\.js\\?render=([A-Za-z0-9_-]+)/);
-                if (m2) return m2[1];
-                return null;
+                return m2 ? m2[1] : null;
             }
         """)
+        if ent:
+            return {"type": "recaptcha_enterprise", "sitekey": ent}
+    except Exception:
+        pass
 
-        if not site_key:
-            log.warning("No reCAPTCHA site key")
-            return None
+    return None
 
-        page_url = page.url
-        log.info("SCTG: site_key=%s page_url=%s", site_key, page_url)
 
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"🧩 <b>SCTG يحل الكابتشا</b>\n"
-                f"Site Key: <code>{site_key[:35]}...</code>"
-            ),
-            parse_mode="HTML",
-        )
+async def ask_user_captcha(bot, chat_id, page, captcha_info):
+    screenshot_path = "/tmp/captcha.png"
+    try:
+        if captcha_info["type"] == "image":
+            await captcha_info["locator"].screenshot(path=screenshot_path)
+        else:
+            await page.screenshot(path=screenshot_path, full_page=False)
+    except Exception:
+        try:
+            await page.screenshot(path=screenshot_path, full_page=False)
+        except Exception:
+            pass
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            # Submit
-            submit_data = {
-                "key": SCTG_API_KEY,
-                "method": "userrecaptcha",
-                "googlekey": site_key,
-                "pageurl": page_url,
-                "enterprise": 1,
-                "invisible": 1,
-                "version": "v3",
-                "action": "login",
-                "json": 1,
-            }
-            r = await client.post(SCTG_SUBMIT, data=submit_data)
-            log.info("SCTG submit: %s", r.text[:200])
+    type_text = {
+        "image": "📷 صورة كابتشا",
+        "input": "⌨️ كابتشا نصية",
+        "recaptcha_v2": "🔒 reCAPTCHA v2",
+        "recaptcha_enterprise": "🔒 reCAPTCHA Enterprise",
+    }.get(captcha_info["type"], "❓ كابتشا")
 
+    caption = (
+        f"🧩 <b>كابتشا مطلوبة!</b>\n"
+        f"النوع: {type_text}\n"
+    )
+    if captcha_info.get("sitekey"):
+        caption += f"Site Key: <code>{captcha_info['sitekey'][:35]}...</code>\n"
+    caption += "\n<b>أرسل الحل هنا:</b>"
+
+    try:
+        with open(screenshot_path, "rb") as f:
+            await bot.send_photo(
+                chat_id=chat_id, photo=f,
+                caption=caption, parse_mode="HTML",
+            )
+    except Exception as e:
+        log.error("send_photo: %s", e)
+        await bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML")
+
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    CAPTCHA_WAIT["future"] = fut
+    CAPTCHA_WAIT["chat_id"] = chat_id
+
+    try:
+        solution = await asyncio.wait_for(fut, timeout=CAPTCHA_TIMEOUT)
+    except asyncio.TimeoutError:
+        await bot.send_message(chat_id=chat_id, text="⏰ ما ردّيتش. نتخطى.")
+        return None
+    finally:
+        CAPTCHA_WAIT["future"] = None
+        CAPTCHA_WAIT["chat_id"] = None
+
+    return solution
+
+
+async def apply_solution(page, captcha_info, solution):
+    try:
+        if captcha_info["type"] in ("image", "input"):
+            loc = captcha_info["locator"]
+            await loc.scroll_into_view_if_needed()
             try:
-                resp = r.json()
+                await loc.click(force=True, timeout=3000)
             except Exception:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"❌ SCTG submit فشل: <code>{r.text[:200]}</code>",
-                    parse_mode="HTML",
+                pass
+            try:
+                await loc.fill("", force=True)
+                await loc.press_sequentially(solution, delay=40)
+                await loc.press("Tab")
+            except Exception:
+                await page.evaluate(
+                    """
+                    ({sel, val}) => {
+                        const el = document.querySelector(sel);
+                        if (!el) return;
+                        el.focus();
+                        const setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value'
+                        ).set;
+                        setter.call(el, val);
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                    """,
+                    {"sel": captcha_info["selector"], "val": solution},
                 )
-                return None
+            return True
 
-            if resp.get("status") != 1:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"❌ SCTG submit error: <code>{resp.get('request')}</code>",
-                    parse_mode="HTML",
-                )
-                return None
-
-            captcha_id = resp["request"]
-            log.info("SCTG id: %s", captcha_id)
-
-            # Poll
-            start = time.time()
-            token = None
-            while time.time() - start < 180:
-                await asyncio.sleep(5)
-                rr = await client.get(
-                    SCTG_RESULT,
-                    params={
-                        "key": SCTG_API_KEY,
-                        "action": "get",
-                        "id": captcha_id,
-                        "json": 1,
-                    },
-                )
-                try:
-                    data = rr.json()
-                except Exception:
-                    continue
-
-                if data.get("status") == 1:
-                    token = data["request"]
-                    break
-                elif data.get("request") == "CAPCHA_NOT_READY":
-                    continue
-                else:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"❌ SCTG error: <code>{data.get('request')}</code>",
-                        parse_mode="HTML",
-                    )
-                    return None
-
-            if not token:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="⏰ SCTG timeout",
-                    parse_mode="HTML",
-                )
-                return None
-
-            log.info("SCTG token: %s...", token[:30])
-
-            # Inject token
+        if captcha_info["type"] in ("recaptcha_v2", "recaptcha_enterprise"):
             await page.evaluate(
                 """
                 (t) => {
@@ -307,10 +340,8 @@ async def solve_recaptcha_sctg(page, bot, chat_id):
                     ta.dispatchEvent(new Event('change', {bubbles: true}));
                 }
                 """,
-                token,
+                solution,
             )
-
-            # Update grecaptcha callback if exists
             try:
                 await page.evaluate(
                     """
@@ -326,46 +357,24 @@ async def solve_recaptcha_sctg(page, bot, chat_id):
                         }
                     }
                     """,
-                    token,
+                    solution,
                 )
             except Exception:
                 pass
-
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ <b>SCTG حل الكابتشا</b>\n<code>{token[:40]}...</code>",
-                parse_mode="HTML",
-            )
-            return token
-
+            return True
     except Exception as e:
-        log.exception("SCTG error")
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ SCTG exception: <code>{e}</code>",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-        return None
-
-
-solve_recaptcha = solve_recaptcha_sctg
+        log.error("apply_solution: %s", e)
+    return False
 
 
 # ============================================================
-#  🌐 Playwright helpers
+#  🌐 Page helpers
 # ============================================================
 async def hide_overlays(page):
     try:
         await page.evaluate("""
             () => {
-                const sels = [
-                    '.swiper', '.swiper-wrapper',
-                    '.cookie-banner', '#onetrust-banner-sdk',
-                    '.grecaptcha-badge',
-                ];
+                const sels = ['.swiper', '.swiper-wrapper', '.grecaptcha-badge'];
                 for (const s of sels) {
                     document.querySelectorAll(s).forEach(el => {
                         el.style.display = 'none';
@@ -513,20 +522,47 @@ async def try_account(browser, user, pwd, bot, chat_id):
             await ctx.close()
             return {"status": "retry"}
 
-        await page.wait_for_timeout(200)
+        await page.wait_for_timeout(300)
 
-        token = await solve_recaptcha(page, bot, chat_id)
-        if token:
+        # 🧩 نتحقق من الكابتشا
+        captcha_info = await detect_captcha(page)
+
+        if captcha_info:
+            log.info("Captcha detected: %s", captcha_info["type"])
             state["stats"].captchas_solved += 1
 
-        await page.wait_for_timeout(200)
+            solution = await ask_user_captcha(bot, chat_id, page, captcha_info)
 
+            if not solution:
+                await ctx.close()
+                return {"status": "retry", "msg": "user didn't answer captcha"}
+
+            ok = await apply_solution(page, captcha_info, solution)
+            if not ok:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ ما قدرناش نحطو الحل. نعاودو...",
+                )
+                await ctx.close()
+                return {"status": "retry"}
+
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ توصلنا بالحل: <code>{solution[:50]}</code>",
+                parse_mode="HTML",
+            )
+            await page.wait_for_timeout(500)
+        else:
+            log.info("No captcha detected")
+
+        # نضغطو Connexion
         if not await click_connexion(page):
             await ctx.close()
             return {"status": "retry"}
 
+        # نستنو النتيجة
         start = time.time()
-        while time.time() - start < 25:
+        while time.time() - start < 30:
             if await is_logged_in(page):
                 await page.wait_for_timeout(1500)
                 body = await page.inner_text("body")
@@ -572,7 +608,7 @@ async def run_check(app, chat_id, accounts):
             f"🚀 <b>بداية الفحص</b>\n"
             f"عدد: <b>{len(accounts)}</b>\n"
             f"الحد: <b>{MIN_BALANCE}</b> دج\n"
-            f"🧩 SCTG solver: مفعّل\n"
+            f"🧩 الكابتشا: يدوياً عبر Telegram\n"
             f"/stop للإيقاف."
         ),
         parse_mode="HTML",
@@ -669,9 +705,10 @@ async def run_check(app, chat_id, accounts):
 # ============================================================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 <b>بوت Ooredoo Railway + SCTG</b>\n\n"
+        "🚀 <b>بوت Ooredoo Railway</b>\n\n"
         "ابعتلي ملف <code>accounts.txt</code>:\n"
         "<code>0553372434:password</code>\n\n"
+        "🧩 إذا طلعت كابتشا، غادي نبعتلك صورة ونستنى الحل منك.\n\n"
         "/start /status /stop",
         parse_mode="HTML",
     )
@@ -693,6 +730,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["stop"] = True
     await update.message.reply_text("⏹️ جاري الإيقاف...")
+    # إذا كاين انتظار كابتشا، نلغيه
+    if CAPTCHA_WAIT["future"] and not CAPTCHA_WAIT["future"].done():
+        CAPTCHA_WAIT["future"].cancel()
 
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -712,14 +752,18 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     accounts = parse_accounts(text)
 
     if not accounts:
-        await update.message.reply_text("❌ الملف فارغ أو الصيغة غالطة.", parse_mode="HTML")
+        await update.message.reply_text(
+            "❌ الملف فارغ أو الصيغة غالطة.", parse_mode="HTML",
+        )
         return
 
     state["running"] = True
     state["stop"] = False
 
     await update.message.reply_text(
-        f"📄 توصلت بـ <b>{len(accounts)}</b> حساب\nنبداو...",
+        f"📄 توصلت بـ <b>{len(accounts)}</b> حساب\n"
+        f"🧩 الكابتشا: نحلها يدوياً\n"
+        f"نبداو...",
         parse_mode="HTML",
     )
     asyncio.create_task(run_check(ctx.application, update.effective_chat.id, accounts))
@@ -728,9 +772,21 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != TELEGRAM_CHAT_ID:
         return
+
     text = update.message.text.strip()
+
+    # ✅ إذا كاين انتظار كابتشا
+    if CAPTCHA_WAIT["future"] and not CAPTCHA_WAIT["future"].done():
+        CAPTCHA_WAIT["future"].set_result(text)
+        await update.message.reply_text(
+            f"✅ توصلت بالحل: <code>{text[:60]}</code>",
+            parse_mode="HTML",
+        )
+        return
+
     if text.startswith("/"):
         return
+
     accounts = parse_accounts(text)
     if accounts:
         if state["running"]:
@@ -751,7 +807,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  Main
 # ============================================================
 def main():
-    print("🚀 Ooredoo Railway Bot + SCTG starting...")
+    print("🚀 Ooredoo Railway Bot starting...")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise Exception("TELEGRAM_TOKEN أو TELEGRAM_CHAT_ID ناقصين")
 
