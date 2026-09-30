@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Railway Bot - tries variants forever until login
+Ooredoo Railway Bot - 05 format only + screenshot
 """
 
 import os
@@ -27,8 +27,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 MIN_BALANCE = int(os.getenv("MIN_BALANCE", "100"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-RETRY_DELAY = 5        # ⚡ بلا حدود
-MAX_RETRY = 999        # 🔄 نعاودو للأبد
+RETRY_DELAY = 5
+MAX_RETRY = 999
 
 SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
 
@@ -136,6 +136,7 @@ def find_balance_in_text(text):
 
 
 def is_invalid_creds(text):
+    """أخطاء تعتبر "invalid" → نتخطاو الصيغة"""
     if not text:
         return False
     t = text.lower()
@@ -146,6 +147,11 @@ def is_invalid_creds(text):
         "invalid credentials",
         "mot de passe incorrect",
         "utilisateur non trouvé",
+        "email invalide",
+        "email invalid",
+        "invalid email",
+        "numéro invalide",
+        "invalid number",
     ])
 
 
@@ -307,6 +313,8 @@ async def detect_red_error(page):
         r"(identifiants?\s+incorrect[s]?[^\n]{0,100})",
         r"(mot de passe\s+incorrect[^\n]{0,100})",
         r"(invalid user credentials[^\n]{0,100})",
+        r"(email\s+invalide[^\n]{0,100})",
+        r"(email\s+invalid[^\n]{0,100})",
         r"(عذرا[^\n]{0,120}معاودة[^\n]{0,120})",
         r"(يرجى معاودة[^\n]{0,120})",
     ]
@@ -345,7 +353,7 @@ async def wait_for_result(page, timeout=45):
 
 
 async def try_account(browser, user, pwd, bot, chat_id):
-    """يجرب 3 صيغ للرقم"""
+    """✅ يجرب الرقم كما هو (05xxxxxxxxx) فقط"""
     ctx = await browser.new_context(
         locale="fr-FR",
         viewport={"width": 412, "height": 915},
@@ -363,84 +371,98 @@ async def try_account(browser, user, pwd, bot, chat_id):
 
         await page.wait_for_timeout(500)
 
-        # صيغ الرقم
-        digits = re.sub(r"\D", "", user)
-        variants = [user]
-        if digits.startswith("0") and len(digits) >= 10:
-            local = digits[1:]
-            variants.append(f"213{local}")
-            variants.append(f"+213{local}")
-        # نحذفو التكرار
-        seen = set()
-        variants = [v for v in variants if not (v in seen or seen.add(v))]
+        # ✅ نجربو الرقم كما هو فقط
+        variant = user
+        log_to_file(f"Trying: {variant}")
 
-        log_to_file(f"Variants: {variants}")
+        if state["stop"]:
+            await ctx.close()
+            return {"status": "retry", "msg": "stopped"}
 
-        for variant in variants:
-            if state["stop"]:
-                await ctx.close()
-                return {"status": "retry", "msg": "stopped"}
+        # نمسحو
+        try:
+            await page.evaluate("""
+                () => {
+                    document.querySelectorAll('input').forEach(inp => {
+                        if (inp.type === 'text' || inp.type === 'password') {
+                            inp.value = '';
+                        }
+                    });
+                }
+            """)
+            await page.wait_for_timeout(300)
+        except Exception:
+            pass
 
-            # نرجعو للصفحة إذا كان مختلف
-            if "/sign-in" not in page.url:
-                await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(2000)
-                await wait_page_ready(page, timeout=15)
+        if not await fill_username(page, variant):
+            log_to_file(f"FAIL username")
+            await ctx.close()
+            return {"status": "retry", "msg": "fill_username"}
 
-            log_to_file(f"  Variant: {variant}")
+        await page.wait_for_timeout(200)
 
-            # نمسحو
-            try:
-                await page.evaluate("""
-                    () => {
-                        document.querySelectorAll('input').forEach(inp => {
-                            if (inp.type === 'text' || inp.type === 'password') {
-                                inp.value = '';
-                            }
-                        });
-                    }
-                """)
-                await page.wait_for_timeout(300)
-            except Exception:
-                pass
+        if not await fill_password(page, pwd):
+            log_to_file(f"FAIL password")
+            await ctx.close()
+            return {"status": "retry", "msg": "fill_password"}
 
-            if not await fill_username(page, variant):
-                log_to_file(f"  FAIL username")
-                continue
+        await page.wait_for_timeout(500)
 
-            await page.wait_for_timeout(200)
+        # 📸 صورة قبل الضغط
+        try:
+            await page.screenshot(path=f"/tmp/before_{variant}.png", full_page=True)
+            with open(f"/tmp/before_{variant}.png", "rb") as f:
+                await bot.send_photo(
+                    chat_id=chat_id, photo=f,
+                    caption=f"📸 قبل الضغط: <code>{variant}</code>",
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            log_to_file(f"screenshot failed: {e}", "WARN")
 
-            if not await fill_password(page, pwd):
-                log_to_file(f"  FAIL password")
-                continue
+        # نضغطو
+        if not await click_connexion(page):
+            log_to_file("FAIL click")
+            await ctx.close()
+            return {"status": "retry", "msg": "click"}
 
-            await page.wait_for_timeout(500)
+        result = await wait_for_result(page, timeout=30)
+        log_to_file(f"Result: {result}")
 
-            if not await click_connexion(page):
-                log_to_file(f"  FAIL click")
-                continue
+        # 📸 صورة بعد الضغط
+        try:
+            await page.screenshot(path=f"/tmp/after_{variant}.png", full_page=False)
+            with open(f"/tmp/after_{variant}.png", "rb") as f:
+                await bot.send_photo(
+                    chat_id=chat_id, photo=f,
+                    caption=f"📸 بعد الضغط: <code>{variant}</code>",
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            log_to_file(f"after screenshot: {e}", "WARN")
 
-            result = await wait_for_result(page, timeout=30)
-            log_to_file(f"  Result: {result}")
+        if result["status"] == "success":
+            await page.wait_for_timeout(2000)
+            body = await page.inner_text("body")
+            bal = find_balance_in_text(body)
+            await ctx.close()
+            return {"status": "success", "balance": bal}
 
-            if result["status"] == "success":
-                await page.wait_for_timeout(2000)
-                body = await page.inner_text("body")
-                bal = find_balance_in_text(body)
-                await ctx.close()
-                return {"status": "success", "balance": bal}
+        if result["status"] == "error":
+            err = result["error"]
+            log_to_file(f"Error: {err}")
+            await ctx.close()
 
-            if result["status"] == "error":
-                err = result["error"]
-                if is_invalid_creds(err):
-                    continue
-                await ctx.close()
-                return {"status": "error", "msg": err, "stop": True}
+            # إذا invalid / email invalide → نعاودو (نفس الصيغة أو نفس الحساب)
+            if is_invalid_creds(err):
+                return {"status": "invalid", "msg": err}
 
-            # timeout → الصيغة التالية
+            # خطأ آخر → نتوقف
+            return {"status": "error", "msg": err, "stop": True}
 
+        # timeout → نعاودو
         await ctx.close()
-        return {"status": "invalid", "msg": "all variants failed"}
+        return {"status": "retry", "msg": "timeout"}
 
     except Exception as e:
         log_to_file(f"try_account exception: {e}", "ERROR")
@@ -479,7 +501,6 @@ async def run_check(app, chat_id, accounts):
                 last_notify = time.time()
                 attempts = 0
 
-                # 🔄 نحاولو بلا حدود
                 while attempts < MAX_RETRY:
                     if state["stop"]:
                         break
@@ -519,12 +540,11 @@ async def run_check(app, chat_id, accounts):
                                 parse_mode="HTML")
                         break
 
-                    # invalid أو retry → نعاودو
                     stats.retries += 1
                     if r["status"] == "invalid":
                         stats.invalid += 1
 
-                    # إشعار كل دقيقة
+                    # إشعار كل 60 ثانية
                     if time.time() - last_notify > 60:
                         await bot.send_message(chat_id=chat_id,
                             text=(f"🔄 {user}\n"
@@ -555,7 +575,7 @@ async def run_check(app, chat_id, accounts):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 بوت Ooredoo\n\nابعتلي ملف accounts.txt\n"
-        "🔄 يعاود للأبد حتى يدخل\n\n"
+        "🔄 يعاود للأبد\n\n"
         "/start /status /stop /log",
         parse_mode="HTML")
 
@@ -582,7 +602,7 @@ async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["stop"] = True
-    await update.message.reply_text("⏹️ جاري الإيقاف...")
+    await update.message.reply_text("⏹️")
 
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -604,7 +624,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["running"] = True
     state["stop"] = False
     await update.message.reply_text(
-        f"📄 {len(accounts)} حساب.\n🔄 نعاودو حتى ندخلو...",
+        f"📄 {len(accounts)} حساب.\n🔄 نعاودو...",
         parse_mode="HTML")
     asyncio.create_task(run_check(ctx.application, update.effective_chat.id, accounts))
 
