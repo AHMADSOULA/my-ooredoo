@@ -1,6 +1,7 @@
+.git
 .env
-state.json
 *.png
-__pycache__/
+__pycache__
 *.pyc
-.venv/
+.venv
+state.json
