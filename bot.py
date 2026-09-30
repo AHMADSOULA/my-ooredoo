@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Bot - with Algerian proxy support
+Ooredoo Bot - with proxy auth
 """
 
 import os
@@ -31,6 +31,10 @@ RETRY_DELAY = 3
 PROXY_SERVER = os.getenv("PROXY_SERVER", "")
 PROXY_USERNAME = os.getenv("PROXY_USERNAME", "")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
+
+# ✅ نضيفو http:// إذا ناقص
+if PROXY_SERVER and not PROXY_SERVER.startswith(("http://", "https://", "socks5://")):
+    PROXY_SERVER = "http://" + PROXY_SERVER
 
 HOME_URL = "https://my.ooredoo.dz/"
 SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
@@ -161,6 +165,39 @@ def is_invalid_creds(text):
 
 
 # ============================================================
+#  ✅ Check proxy
+# ============================================================
+async def check_proxy():
+    if not PROXY_SERVER:
+        return True
+    log_to_file(f"Checking proxy: {PROXY_SERVER}")
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            ctx_args = {"proxy": {"server": PROXY_SERVER}}
+            if PROXY_USERNAME:
+                ctx_args["proxy"]["username"] = PROXY_USERNAME
+            if PROXY_PASSWORD:
+                ctx_args["proxy"]["password"] = PROXY_PASSWORD
+            ctx = await browser.new_context(**ctx_args)
+            page = await ctx.new_page()
+            await page.goto(
+                "https://api.ipify.org?format=json",
+                timeout=20000,
+                wait_until="domcontentloaded",
+            )
+            body = await page.inner_text("body")
+            log_to_file(f"Proxy IP: {body}")
+            print(f"🌍 Proxy IP: {body}")
+            await browser.close()
+            return True
+    except Exception as e:
+        log_to_file(f"Proxy check failed: {e}", "ERROR")
+        print(f"❌ Proxy failed: {e}")
+        return False
+
+
+# ============================================================
 #  ✅ Create context with proxy
 # ============================================================
 async def create_context(browser):
@@ -180,7 +217,6 @@ async def create_context(browser):
             proxy["password"] = PROXY_PASSWORD
         ctx_args["proxy"] = proxy
         log_to_file(f"Using proxy: {PROXY_SERVER}")
-        print(f"🌍 Using proxy: {PROXY_SERVER}")
 
     ctx = await browser.new_context(**ctx_args)
 
@@ -193,7 +229,7 @@ async def create_context(browser):
 
 
 # ============================================================
-#  ✅ Safe screenshot
+#  Safe screenshot
 # ============================================================
 async def safe_screenshot(page, path, full_page=True):
     try:
@@ -211,7 +247,7 @@ async def safe_screenshot(page, path, full_page=True):
 
 
 # ============================================================
-#  🧩 reCAPTCHA
+#  reCAPTCHA
 # ============================================================
 async def inject_recaptcha_token(page):
     try:
@@ -329,6 +365,22 @@ async def inject_recaptcha_token(page):
 # ============================================================
 async def run_otp_flow(app, chat_id, phone):
     bot = app.bot
+
+    # ✅ نتحققو من البروكسي
+    if PROXY_SERVER:
+        await bot.send_message(chat_id=chat_id,
+            text="🌍 نتحققو من البروكسي...", parse_mode="HTML")
+        proxy_ok = await check_proxy()
+        if not proxy_ok:
+            await bot.send_message(chat_id=chat_id,
+                text="❌ <b>البروكسي ماشي خدام!</b>\n"
+                     "تأكد من البيانات في Railway Variables.",
+                parse_mode="HTML")
+            state["running"] = False
+            return
+        await bot.send_message(chat_id=chat_id,
+            text="✅ البروكسي خدام", parse_mode="HTML")
+
     await bot.send_message(chat_id=chat_id,
         text=f"📱 <b>OTP Flow</b>\nالرقم: <code>{phone}</code>",
         parse_mode="HTML")
