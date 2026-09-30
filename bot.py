@@ -4,7 +4,7 @@
 Ooredoo Railway Bot
 - Playwright browser
 - Telegram interface
-- Manual captcha solving via Telegram
+- Manual captcha solving (only if visible)
 """
 
 import os
@@ -164,9 +164,10 @@ def is_retryable(text):
 
 
 # ============================================================
-#  🧩 كشف الكابتشا
+#  🧩 كشف الكابتشا (فقط المرئية)
 # ============================================================
 async def detect_captcha(page):
+    # 1) صورة كابتشا مرئية
     for sel in [
         "img[src*='captcha' i]",
         "img[id*='captcha' i]",
@@ -175,10 +176,14 @@ async def detect_captcha(page):
         try:
             loc = page.locator(sel).first
             if await loc.count() > 0 and await loc.is_visible():
-                return {"type": "image", "locator": loc, "selector": sel}
+                box = await loc.bounding_box()
+                if box and box["width"] > 20 and box["height"] > 20:
+                    log.info("Captcha: image visible")
+                    return {"type": "image", "locator": loc, "selector": sel}
         except Exception:
             continue
 
+    # 2) input نصي مرئي
     for sel in [
         "input[name='ca']",
         "input[id='ca']",
@@ -188,45 +193,53 @@ async def detect_captcha(page):
         try:
             loc = page.locator(sel).first
             if await loc.count() > 0 and await loc.is_visible():
-                return {"type": "input", "locator": loc, "selector": sel}
+                box = await loc.bounding_box()
+                if box and box["width"] > 20:
+                    log.info("Captcha: input visible")
+                    return {"type": "input", "locator": loc, "selector": sel}
         except Exception:
             continue
 
+    # 3) reCAPTCHA v2 مرئي
     try:
         v2 = page.locator("iframe[src*='google.com/recaptcha/api2/anchor']").first
         if await v2.count() > 0:
-            box = await v2.bounding_box()
-            if box and box["width"] > 0:
+            if await v2.is_visible():
+                box = await v2.bounding_box()
+                if box and box["width"] > 50 and box["height"] > 30:
+                    log.info("Captcha: reCAPTCHA v2 visible")
+                    site_key = await page.evaluate("""
+                        () => {
+                            const ifr = document.querySelector("iframe[src*='recaptcha/api2/anchor']");
+                            if (!ifr) return null;
+                            const m = ifr.src.match(/[?&]k=([^&]+)/);
+                            return m ? m[1] : null;
+                        }
+                    """)
+                    return {"type": "recaptcha_v2", "sitekey": site_key}
+    except Exception:
+        pass
+
+    # 4) Enterprise مرئي فقط
+    try:
+        ent = page.locator("iframe[src*='recaptcha'][src*='enterprise']").first
+        if await ent.count() > 0 and await ent.is_visible():
+            box = await ent.bounding_box()
+            if box and box["width"] > 100 and box["height"] > 50:
+                log.info("Captcha: Enterprise iframe visible")
                 site_key = await page.evaluate("""
                     () => {
-                        const ifr = document.querySelector("iframe[src*='recaptcha/api2/anchor']");
+                        const ifr = document.querySelector("iframe[src*='recaptcha'][src*='enterprise']");
                         if (!ifr) return null;
                         const m = ifr.src.match(/[?&]k=([^&]+)/);
                         return m ? m[1] : null;
                     }
                 """)
-                return {"type": "recaptcha_v2", "sitekey": site_key}
+                return {"type": "recaptcha_enterprise", "sitekey": site_key}
     except Exception:
         pass
 
-    try:
-        ent = await page.evaluate("""
-            () => {
-                const scripts = [...document.querySelectorAll('script[src]')];
-                for (const s of scripts) {
-                    const m = s.src.match(/[?&]render=([^&]+)/);
-                    if (m && m[1] !== 'explicit') return m[1];
-                }
-                const html = document.documentElement.innerHTML;
-                const m2 = html.match(/recaptcha\\/enterprise\\.js\\?render=([A-Za-z0-9_-]+)/);
-                return m2 ? m2[1] : null;
-            }
-        """)
-        if ent:
-            return {"type": "recaptcha_enterprise", "sitekey": ent}
-    except Exception:
-        pass
-
+    log.info("No visible captcha")
     return None
 
 
@@ -384,13 +397,7 @@ async def hide_overlays(page):
 
 
 async def fill_username(page, username):
-    """
-    يعبّي حقل اسم المستخدم بطرق متعددة:
-    1) JS مباشر (setter + events)
-    2) press_sequentially (Vue friendly)
-    3) type (force)
-    """
-    # 1) JS مباشر
+    # 1) JS setter
     try:
         ok = await page.evaluate("""
             (val) => {
@@ -428,8 +435,6 @@ async def fill_username(page, username):
             }
         """, username)
         if ok:
-            log.info("Username filled via JS setter")
-            # نتحققو
             check = await page.evaluate("""
                 () => {
                     const labels = [...document.querySelectorAll('label, .v-label, p')];
@@ -448,9 +453,9 @@ async def fill_username(page, username):
                 }
             """)
             if check == username:
-                log.info("Username verified: %s", check)
+                log.info("Username filled via JS")
                 return True
-            log.info("Username check: got '%s' expected '%s'", check, username)
+            log.info("JS fill: got '%s' expected '%s'", check, username)
     except Exception as e:
         log.warning("JS fill failed: %s", e)
 
@@ -514,9 +519,6 @@ async def fill_username(page, username):
 
 
 async def fill_password(page, password):
-    """
-    يعبّي كلمة السر بطرق متعددة
-    """
     # 1) JS
     try:
         ok = await page.evaluate("""
@@ -633,10 +635,8 @@ async def try_account(browser, user, pwd, bot, chat_id):
         await page.wait_for_timeout(4000)
         await hide_overlays(page)
 
-        # 🎯 اسم المستخدم — نجربو نتحققو
         if not await fill_username(page, user):
             log.error("Fill username FAILED for %s", user)
-            # نصوّرو الحالة باش نشوفو المشكل
             try:
                 await page.screenshot(path="/tmp/fill_username_fail.png", full_page=True)
                 with open("/tmp/fill_username_fail.png", "rb") as f:
@@ -651,7 +651,6 @@ async def try_account(browser, user, pwd, bot, chat_id):
 
         await page.wait_for_timeout(200)
 
-        # 🎯 كلمة السر
         if not await fill_password(page, pwd):
             log.error("Fill password FAILED for %s", user)
             await ctx.close()
@@ -659,13 +658,7 @@ async def try_account(browser, user, pwd, bot, chat_id):
 
         await page.wait_for_timeout(300)
 
-        # نصوّرو باش نتأكدو
-        try:
-            await page.screenshot(path="/tmp/filled.png", full_page=False)
-        except Exception:
-            pass
-
-        # 🧩 الكابتشا
+        # 🧩 نتحققو من الكابتشا (مرئية فقط)
         captcha_info = await detect_captcha(page)
         if captcha_info:
             log.info("Captcha detected: %s", captcha_info["type"])
@@ -680,6 +673,8 @@ async def try_account(browser, user, pwd, bot, chat_id):
                 await ctx.close()
                 return {"status": "retry"}
             await page.wait_for_timeout(500)
+        else:
+            log.info("No captcha, proceeding")
 
         if not await click_connexion(page):
             await ctx.close()
@@ -732,7 +727,6 @@ async def run_check(app, chat_id, accounts):
             f"🚀 <b>بداية الفحص</b>\n"
             f"عدد: <b>{len(accounts)}</b>\n"
             f"الحد: <b>{MIN_BALANCE}</b> دج\n"
-            f"🧩 الكابتشا: يدوياً\n"
             f"/stop للإيقاف."
         ),
         parse_mode="HTML",
@@ -827,7 +821,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🚀 <b>بوت Ooredoo Railway</b>\n\n"
         "ابعتلي ملف <code>accounts.txt</code>:\n"
         "<code>0553372434:password</code>\n\n"
-        "🧩 إذا طلعت كابتشا، غادي نبعتلك صورة.\n\n"
         "/start /status /stop",
         parse_mode="HTML",
     )
