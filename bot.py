@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Bot - sends logs when OTP page doesn't change
+Ooredoo Bot
+- user:pass (ملف) → فحص عادي
+- رقم فقط → OTP flow (مع fill() صحيح)
 """
 
 import os
@@ -119,9 +121,7 @@ def is_single_phone(text):
     if not text or ":" in text or " " in text:
         return False
     digits = re.sub(r"\D", "", text)
-    if len(digits) < 9 or len(digits) > 13:
-        return False
-    return True
+    return 9 <= len(digits) <= 13
 
 
 def find_balance_in_text(text):
@@ -158,7 +158,7 @@ def is_invalid_creds(text):
 
 
 # ============================================================
-#  OTP Flow
+#  OTP Flow - v2 (fill + keyboard + JS)
 # ============================================================
 async def run_otp_flow(app, chat_id, phone):
     bot = app.bot
@@ -183,58 +183,158 @@ async def run_otp_flow(app, chat_id, phone):
 
             await bot.send_message(chat_id=chat_id, text="🌐 نفتحو الصفحة...")
             await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(5000)
             log_to_file(f"Loaded {page.url}")
 
             try:
-                await page.wait_for_selector("input[placeholder*='05']", timeout=15000)
-                log_to_file("Input field found")
+                await page.wait_for_selector("input[placeholder*='05'], input[type='number']", timeout=15000)
+                log_to_file("Input found")
             except Exception as e:
                 log_to_file(f"Input not found: {e}", "WARN")
 
+            # 📸 الصفحة الأولى
             await page.screenshot(path="/tmp/otp_step1.png", full_page=True)
             with open("/tmp/otp_step1.png", "rb") as f:
                 await bot.send_photo(chat_id=chat_id, photo=f,
                     caption="📸 الصفحة الرئيسية", parse_mode="HTML")
 
-            # كتابة الرقم
+            # ✅ كتابة الرقم — 3 طرق
             ok = False
+
+            # طريقة 1: fill()
             try:
-                loc = page.locator("input[placeholder*='05'], input[type='number'], input[inputmode='tel']").first
+                loc = page.locator("input[aria-label='Ooredoo mobile number']").first
+                if await loc.count() == 0:
+                    loc = page.locator("input[placeholder*='05']").first
+                if await loc.count() == 0:
+                    loc = page.locator("input[type='number']").first
+
                 if await loc.count() > 0:
+                    await loc.scroll_into_view_if_needed()
                     await loc.click(timeout=5000)
                     await page.wait_for_timeout(200)
-                    await page.keyboard.press("Control+A")
-                    await page.keyboard.press("Delete")
-                    await page.keyboard.type(phone, delay=80)
+                    await loc.fill("")
+                    await page.wait_for_timeout(100)
+                    await loc.fill(phone)
                     await page.wait_for_timeout(500)
-                    if await loc.input_value():
+                    val = await loc.input_value()
+                    log_to_file(f"fill() value: '{val}'")
+
+                    btn_disabled = await page.evaluate("""
+                        () => {
+                            const btns = [...document.querySelectorAll('button')];
+                            const t = btns.find(b => /acc[ée]der/i.test(b.textContent || ''));
+                            return t ? t.disabled : null;
+                        }
+                    """)
+                    log_to_file(f"Btn disabled after fill: {btn_disabled}")
+
+                    if val == phone:
                         ok = True
-                        log_to_file(f"Filled: {phone}")
             except Exception as e:
-                log_to_file(f"Fill failed: {e}", "ERROR")
+                log_to_file(f"fill() failed: {e}", "ERROR")
+
+            # طريقة 2: keyboard.type()
+            if not ok:
+                try:
+                    loc = page.locator("input[type='number'], input[inputmode='tel']").first
+                    if await loc.count() > 0:
+                        await loc.click(timeout=5000)
+                        await page.wait_for_timeout(200)
+                        await loc.fill("")
+                        await page.wait_for_timeout(100)
+                        await page.keyboard.type(phone, delay=100)
+                        await page.wait_for_timeout(500)
+                        val = await loc.input_value()
+                        if val == phone:
+                            ok = True
+                            log_to_file("Filled via type()")
+                except Exception as e:
+                    log_to_file(f"type failed: {e}", "ERROR")
+
+            # طريقة 3: JS events
+            if not ok:
+                try:
+                    done = await page.evaluate("""
+                        (val) => {
+                            const inp = document.querySelector("input[aria-label='Ooredoo mobile number']")
+                                || document.querySelector("input[type='number']");
+                            if (!inp) return false;
+                            inp.focus();
+                            const setter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value'
+                            ).set;
+                            setter.call(inp, val);
+                            inp.dispatchEvent(new Event('input',  {bubbles: true}));
+                            inp.dispatchEvent(new Event('change', {bubbles: true}));
+                            inp.dispatchEvent(new Event('blur',   {bubbles: true}));
+                            inp.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
+                            return inp.value === val;
+                        }
+                    """, phone)
+                    if done:
+                        ok = True
+                        log_to_file("Filled via JS")
+                except Exception as e:
+                    log_to_file(f"JS failed: {e}", "ERROR")
 
             if not ok:
                 await bot.send_message(chat_id=chat_id, text="❌ ما قدرناش نكتبو الرقم")
+                try:
+                    with open(LOG_FILE, "rb") as f:
+                        await bot.send_document(chat_id=chat_id, document=f,
+                            filename="bot.log", caption="📋 Logs")
+                except Exception:
+                    pass
                 await browser.close()
                 return
 
+            # 📸 بعد الكتابة
             await page.screenshot(path="/tmp/otp_step2.png", full_page=True)
             with open("/tmp/otp_step2.png", "rb") as f:
                 await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption=f"📸 بعد كتابة الرقم <code>{phone}</code>",
+                    caption=f"📸 بعد كتابة <code>{phone}</code>",
                     parse_mode="HTML")
 
-            # الضغط
+            # زر — نتحققو + نضغطو
             old_url = page.url
+            btn_state = await page.evaluate("""
+                () => {
+                    const btns = [...document.querySelectorAll('button')];
+                    const t = btns.find(b => /acc[ée]der/i.test(b.textContent || ''));
+                    if (!t) return null;
+                    return {
+                        disabled: t.disabled,
+                        text: (t.textContent || '').trim(),
+                    };
+                }
+            """)
+            log_to_file(f"Btn state: {btn_state}")
+
+            if btn_state and btn_state.get("disabled"):
+                log_to_file("Force enabling btn")
+                await page.evaluate("""
+                    () => {
+                        const btns = [...document.querySelectorAll('button')];
+                        const t = btns.find(b => /acc[ée]der/i.test(b.textContent || ''));
+                        if (t) {
+                            t.removeAttribute('disabled');
+                            t.disabled = false;
+                            t.classList.remove('v-btn--disabled');
+                        }
+                    }
+                """)
+                await page.wait_for_timeout(300)
+
+            # نضغطو
             clicked = False
             try:
                 btn = page.get_by_role("button",
-                    name=re.compile("acc[ée]der|num[ée]ro", re.I))
+                    name=re.compile("acc[ée]der", re.I))
                 if await btn.count() > 0:
                     await btn.first.click(timeout=5000)
                     clicked = True
-                    log_to_file("Clicked btn role")
+                    log_to_file("Clicked via role")
             except Exception as e:
                 log_to_file(f"click role: {e}", "WARN")
 
@@ -243,8 +343,7 @@ async def run_otp_flow(app, chat_id, phone):
                     clicked = bool(await page.evaluate("""
                         () => {
                             const btns = [...document.querySelectorAll('button')];
-                            const t = btns.find(b =>
-                                /acc[ée]der/i.test(b.textContent || ''));
+                            const t = btns.find(b => /acc[ée]der/i.test(b.textContent || ''));
                             if (!t) return false;
                             t.removeAttribute('disabled');
                             t.disabled = false;
@@ -253,12 +352,11 @@ async def run_otp_flow(app, chat_id, phone):
                         }
                     """))
                     log_to_file(f"Clicked JS: {clicked}")
-                except Exception as e:
-                    log_to_file(f"click JS: {e}", "ERROR")
+                except Exception:
+                    pass
 
             if not clicked:
                 await bot.send_message(chat_id=chat_id, text="❌ ما لقيناش زر")
-                # نبعثو logs
                 try:
                     with open(LOG_FILE, "rb") as f:
                         await bot.send_document(chat_id=chat_id, document=f,
@@ -270,7 +368,7 @@ async def run_otp_flow(app, chat_id, phone):
 
             # نستنو الصفحة تتبدل
             await bot.send_message(chat_id=chat_id,
-                text="⏳ <b>نستنو الصفحة تتبدل...</b> (حد 60 ثانية)",
+                text="⏳ <b>نستنو الصفحة تتبدل...</b> (60s)",
                 parse_mode="HTML")
 
             page_changed = False
@@ -302,7 +400,6 @@ async def run_otp_flow(app, chat_id, phone):
                         }
                     """)
                     if has_otp:
-                        log_to_file("OTP field visible!")
                         otp_field_visible = True
                         break
                 except Exception:
@@ -316,113 +413,68 @@ async def run_otp_flow(app, chat_id, phone):
 
             if page_changed or otp_field_visible:
                 await bot.send_message(chat_id=chat_id,
-                    text=(f"✅ <b>الصفحة تبدلت!</b>\n"
-                          f"URL: <code>{page.url}</code>\n"
+                    text=(f"✅ <b>الصفحة تبدلت!</b>\nURL: <code>{page.url}</code>\n"
                           f"حقل OTP: {'✅' if otp_field_visible else '⚠️'}"),
                     parse_mode="HTML")
             else:
-                # 🛑 الصفحة ما تبدلتش → نبعثو كامل المعلومات
+                # ما تبدلتش → نبعثو التفاصيل
                 await bot.send_message(chat_id=chat_id,
-                    text="⏰ <b>الصفحة ما تبدلتش</b>\n"
-                         "📄 نبعثلك ملفات التشخيص...",
+                    text="⏰ <b>الصفحة ما تبدلتش</b>\n📄 نبعثلك التشخيص...",
                     parse_mode="HTML")
 
-                # نسجلو كل شي
                 try:
                     log_to_file("=" * 60)
                     log_to_file("OTP FAILED - no change")
                     log_to_file(f"URL: {page.url}")
-
                     btn_info = await page.evaluate("""
                         () => {
                             const btns = [...document.querySelectorAll('button')];
                             return btns.map(b => ({
                                 text: (b.textContent || '').trim().slice(0, 60),
                                 disabled: b.disabled,
-                                ariaLabel: b.getAttribute('aria-label') || '',
                             }));
                         }
                     """)
                     log_to_file(f"Buttons: {btn_info}")
-
                     inp_val = await page.locator("input").first.input_value()
                     log_to_file(f"Input value: '{inp_val}'")
-
-                    errors = await page.evaluate("""
-                        () => {
-                            const out = [];
-                            document.querySelectorAll(
-                                '.v-messages__message, .v-input__details .v-messages'
-                            ).forEach(m => {
-                                const t = (m.textContent || '').trim();
-                                if (t) out.push(t);
-                            });
-                            return out;
-                        }
-                    """)
-                    log_to_file(f"Errors: {errors}")
-
-                    toasts = await page.evaluate("""
-                        () => {
-                            const out = [];
-                            document.querySelectorAll(
-                                '.Vue-Toastification__toast, .v-snackbar'
-                            ).forEach(t => {
-                                const txt = (t.textContent || '').trim();
-                                if (txt) out.push(txt);
-                            });
-                            return out;
-                        }
-                    """)
-                    log_to_file(f"Toasts: {toasts}")
                     log_to_file("=" * 60)
                 except Exception as e:
                     log_to_file(f"dump: {e}", "ERROR")
 
-                # HTML
                 try:
                     html = await page.content()
                     with open("/tmp/otp_fail.html", "w", encoding="utf-8") as f:
                         f.write(html)
-                except Exception as e:
-                    log_to_file(f"save html: {e}", "ERROR")
+                except Exception:
+                    pass
 
-                # صورة
                 try:
                     await page.screenshot(path="/tmp/otp_fail.png", full_page=True)
                 except Exception:
                     pass
 
-                # 📋 نبعثو logs
                 try:
                     with open(LOG_FILE, "rb") as f:
                         await bot.send_document(chat_id=chat_id, document=f,
                             filename="bot.log", caption="📋 Logs")
-                except Exception as e:
-                    log_to_file(f"send log: {e}", "ERROR")
+                except Exception:
+                    pass
 
-                # 📄 نبعثو HTML
                 try:
                     with open("/tmp/otp_fail.html", "rb") as f:
                         await bot.send_document(chat_id=chat_id, document=f,
                             filename="otp_fail.html", caption="📄 HTML")
-                except Exception as e:
-                    log_to_file(f"send html: {e}", "ERROR")
-
-                # 📸 صورة
-                try:
-                    with open("/tmp/otp_fail.png", "rb") as f:
-                        await bot.send_photo(chat_id=chat_id, photo=f,
-                            caption="📸 صورة الفشل")
                 except Exception:
                     pass
 
-                # نطلب الرمز رغم كل شي
-                await bot.send_message(chat_id=chat_id,
-                    text="💡 <b>إذا جاك SMS</b>، ابعتلي الرمز. سنستمر.",
-                    parse_mode="HTML")
+                try:
+                    with open("/tmp/otp_fail.png", "rb") as f:
+                        await bot.send_photo(chat_id=chat_id, photo=f,
+                            caption="📸 صورة")
+                except Exception:
+                    pass
 
-            # نستنو
             await page.wait_for_timeout(2000)
 
             await page.screenshot(path="/tmp/otp_step3.png", full_page=True)
@@ -430,7 +482,7 @@ async def run_otp_flow(app, chat_id, phone):
                 await bot.send_photo(chat_id=chat_id, photo=f,
                     caption="📸 الصفحة الحالية", parse_mode="HTML")
 
-            # نطلب الرمز
+            # نطلب OTP
             loop = asyncio.get_event_loop()
             fut = loop.create_future()
             state["otp_waiting"] = True
@@ -438,7 +490,7 @@ async def run_otp_flow(app, chat_id, phone):
             state["otp_chat"] = chat_id
 
             await bot.send_message(chat_id=chat_id,
-                text="🔐 <b>ابعتلي رمز OTP</b> (اللي جاك في SMS)",
+                text="🔐 <b>ابعتلي رمز OTP</b> (SMS)",
                 parse_mode="HTML")
 
             try:
@@ -454,7 +506,6 @@ async def run_otp_flow(app, chat_id, phone):
 
             log_to_file(f"OTP code: {otp_code}")
 
-            # نكتبو
             try:
                 inputs = await page.locator(
                     "input[type='tel'], input[type='number'], "
@@ -482,7 +533,6 @@ async def run_otp_flow(app, chat_id, phone):
                     caption=f"📸 بعد كتابة <code>{otp_code}</code>",
                     parse_mode="HTML")
 
-            # نضغطو
             try:
                 btn = page.get_by_role("button",
                     name=re.compile("valider|v[ée]rifier|confirmer|suivant|continuer", re.I))
