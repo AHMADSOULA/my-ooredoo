@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Railway Bot
-- Playwright browser + Telegram
-- Waits for fields (not spinner)
-- On error → stops and sends screenshot
+Ooredoo Railway Bot with detailed logging
 """
 
 import os
@@ -38,11 +35,31 @@ MAX_RETRY = 10
 
 SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
 
+LOG_FILE = "/tmp/bot.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("ooredoo")
+
+# ✅ Log إلى ملف
+try:
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(fh)
+except Exception as e:
+    print(f"Failed to setup file log: {e}")
+
+
+def log_to_file(msg, level="INFO"):
+    """نسجلو مباشرة في الملف"""
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"[{ts}] [{level}] {msg}\n")
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -148,12 +165,9 @@ def is_invalid_creds(text):
 
 
 # ============================================================
-#  ⏳ انتظار الصفحة — بالحقول فقط
+#  ⏳ انتظار الصفحة
 # ============================================================
 async def wait_page_ready(page, timeout=30):
-    """
-    نستنو الحقول تظهر (نتجاهلو الـ spinner)
-    """
     start = time.time()
     last_log = 0
 
@@ -175,19 +189,19 @@ async def wait_page_ready(page, timeout=30):
             """)
 
             if has_fields.get("has_password") and has_fields.get("has_text"):
-                log.info("Page ready (fields visible)")
+                log_to_file("Page ready (fields visible)")
                 return True
 
             if time.time() - last_log > 5:
-                log.info("Waiting for fields: %s", has_fields)
+                log_to_file(f"Waiting for fields: {has_fields}")
                 last_log = time.time()
 
         except Exception as e:
-            log.warning("wait_page_ready check failed: %s", e)
+            log_to_file(f"wait_page_ready check failed: {e}", "WARN")
 
         await asyncio.sleep(0.3)
 
-    log.warning("wait_page_ready timeout")
+    log_to_file("wait_page_ready timeout", "WARN")
     return False
 
 
@@ -212,8 +226,148 @@ async def hide_overlays(page):
 
 
 async def fill_username(page, username):
-    # 1) JS
+    """5 طرق مع logging مفصل"""
+    log_to_file("=" * 60)
+    log_to_file(f"START fill_username: {username}")
+
+    # 🔍 1) dump inputs
     try:
+        inputs_info = await page.evaluate("""
+            () => {
+                const result = [];
+                const inputs = [...document.querySelectorAll('input')];
+                inputs.forEach((inp, i) => {
+                    const st = getComputedStyle(inp);
+                    const rect = inp.getBoundingClientRect();
+                    result.push({
+                        idx: i,
+                        type: inp.type || '',
+                        name: inp.name || '',
+                        id: inp.id || '',
+                        placeholder: inp.placeholder || '',
+                        ariaLabel: inp.getAttribute('aria-label') || '',
+                        value: inp.value || '',
+                        readonly: inp.readOnly,
+                        disabled: inp.disabled,
+                        visible: st.display !== 'none' && st.visibility !== 'hidden' && rect.width > 0,
+                        rect: {w: Math.round(rect.width), h: Math.round(rect.height)},
+                    });
+                });
+                return result;
+            }
+        """)
+        log_to_file(f"FOUND {len(inputs_info)} inputs")
+        for inp in inputs_info:
+            log_to_file(f"  input[{inp['idx']}] type={inp['type']} name={inp['name']} id={inp['id']} placeholder='{inp['placeholder']}' ariaLabel='{inp['ariaLabel']}' value='{inp['value']}' readonly={inp['readonly']} disabled={inp['disabled']} visible={inp['visible']} rect={inp['rect']}")
+    except Exception as e:
+        log_to_file(f"dump inputs failed: {e}", "ERROR")
+
+    # 🔍 2) dump labels
+    try:
+        labels_info = await page.evaluate("""
+            () => {
+                const out = [];
+                const els = [...document.querySelectorAll('label, .v-label, p, span')];
+                els.forEach((el) => {
+                    const t = (el.textContent || '').trim();
+                    if (t && t.length < 60 && /utilisateur/i.test(t)) {
+                        const st = getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        out.push({
+                            tag: el.tagName,
+                            text: t,
+                            visible: st.display !== 'none' && st.visibility !== 'hidden' && rect.width > 0,
+                            rect: {w: Math.round(rect.width), h: Math.round(rect.height)},
+                        });
+                    }
+                });
+                return out;
+            }
+        """)
+        log_to_file(f"FOUND {len(labels_info)} labels with 'utilisateur'")
+        for l in labels_info:
+            log_to_file(f"  label: tag={l['tag']} text='{l['text']}' visible={l['visible']} rect={l['rect']}")
+    except Exception as e:
+        log_to_file(f"dump labels failed: {e}", "ERROR")
+
+    # ============ 1) get_by_label ============
+    try:
+        log_to_file("TRY get_by_label")
+        loc = page.get_by_label(re.compile("nom d'utilisateur", re.I))
+        cnt = await loc.count()
+        log_to_file(f"  count={cnt}")
+        if cnt > 0:
+            el = loc.first
+            await el.scroll_into_view_if_needed()
+            try:
+                await el.click(timeout=3000)
+            except Exception:
+                await el.click(force=True)
+            await el.fill("")
+            await el.press_sequentially(username, delay=50)
+            await el.press("Tab")
+            await page.wait_for_timeout(300)
+            val = await el.input_value()
+            log_to_file(f"  after fill: value='{val}'")
+            if val == username:
+                log_to_file("  SUCCESS get_by_label")
+                return True
+    except Exception as e:
+        log_to_file(f"  FAILED get_by_label: {e}", "ERROR")
+
+    # ============ 2) get_by_role ============
+    try:
+        log_to_file("TRY get_by_role")
+        loc = page.get_by_role("textbox", name=re.compile("utilisateur", re.I))
+        cnt = await loc.count()
+        log_to_file(f"  count={cnt}")
+        if cnt > 0:
+            el = loc.first
+            try:
+                await el.click(timeout=3000)
+            except Exception:
+                await el.click(force=True)
+            await el.fill("")
+            await el.press_sequentially(username, delay=50)
+            await el.press("Tab")
+            await page.wait_for_timeout(300)
+            val = await el.input_value()
+            log_to_file(f"  after fill: value='{val}'")
+            if val == username:
+                log_to_file("  SUCCESS get_by_role")
+                return True
+    except Exception as e:
+        log_to_file(f"  FAILED get_by_role: {e}", "ERROR")
+
+    # ============ 3) XPath ============
+    try:
+        log_to_file("TRY XPath")
+        xp = "xpath=//label[contains(., \"Nom d'utilisateur\")]/following::input[1]"
+        loc = page.locator(xp)
+        cnt = await loc.count()
+        log_to_file(f"  count={cnt}")
+        if cnt > 0:
+            el = loc.first
+            await el.scroll_into_view_if_needed()
+            try:
+                await el.click(timeout=3000)
+            except Exception:
+                await el.click(force=True)
+            await el.fill("")
+            await el.press_sequentially(username, delay=50)
+            await el.press("Tab")
+            await page.wait_for_timeout(300)
+            val = await el.input_value()
+            log_to_file(f"  after fill: value='{val}'")
+            if val == username:
+                log_to_file("  SUCCESS XPath")
+                return True
+    except Exception as e:
+        log_to_file(f"  FAILED XPath: {e}", "ERROR")
+
+    # ============ 4) JS ============
+    try:
+        log_to_file("TRY JS")
         ok = await page.evaluate("""
             (val) => {
                 const labels = [...document.querySelectorAll('label, .v-label, p')];
@@ -236,7 +390,7 @@ async def fill_username(page, username):
                     });
                     if (inputs.length) target = inputs[0];
                 }
-                if (!target) return false;
+                if (!target) return {ok: false};
                 target.focus();
                 const setter = Object.getOwnPropertyDescriptor(
                     window.HTMLInputElement.prototype, 'value'
@@ -246,74 +400,54 @@ async def fill_username(page, username):
                 target.dispatchEvent(new Event('change', {bubbles: true}));
                 target.dispatchEvent(new Event('blur', {bubbles: true}));
                 target.dispatchEvent(new Event('keyup', {bubbles: true}));
-                return true;
+                return {ok: true, after: target.value};
             }
         """, username)
-        if ok:
+        log_to_file(f"  JS result: {ok}")
+        if ok.get("ok"):
+            await page.wait_for_timeout(500)
             check = await page.evaluate("""
                 () => {
-                    const labels = [...document.querySelectorAll('label, .v-label, p')];
-                    for (const l of labels) {
-                        if (/nom d'utilisateur/i.test(l.textContent || '')) {
-                            let n = l.parentElement;
-                            for (let i = 0; i < 5 && n; i++) {
-                                const inp = n.querySelector('input:not([type=password]):not([type=hidden])');
-                                if (inp) return inp.value;
-                                n = n.parentElement;
-                            }
-                        }
-                    }
-                    const inp = document.querySelector('input:not([type=password]):not([type=hidden])');
-                    return inp ? inp.value : '';
+                    const inputs = [...document.querySelectorAll('input')].filter(i => {
+                        const t = i.type || 'text';
+                        return t !== 'password' && t !== 'hidden' && i.offsetParent !== null;
+                    });
+                    return inputs[0] ? inputs[0].value : '';
                 }
             """)
+            log_to_file(f"  after JS: value='{check}'")
             if check == username:
-                log.info("Username filled via JS")
+                log_to_file("  SUCCESS JS")
                 return True
     except Exception as e:
-        log.warning("JS fill failed: %s", e)
+        log_to_file(f"  FAILED JS: {e}", "ERROR")
 
-    # 2) press_sequentially
+    # ============ 5) generic ============
     try:
-        loc = None
-        try:
-            xp = "xpath=//label[contains(., \"Nom d'utilisateur\")]/following::input[1]"
-            l = page.locator(xp).first
-            if await l.count() > 0:
-                loc = l
-        except Exception:
-            pass
-
-        if not loc:
-            for sel in [
-                "input[placeholder*='utilisateur' i]",
-                "input[name*='user' i]",
-                "input[id*='user' i]",
-            ]:
-                l = page.locator(sel).first
-                if await l.count() > 0:
-                    loc = l
-                    break
-
-        if not loc:
-            loc = page.locator("input:not([type=password]):not([type=hidden])").first
-
-        if loc and await loc.count() > 0:
-            await loc.scroll_into_view_if_needed()
+        log_to_file("TRY generic")
+        loc = page.locator("input:not([type=password]):not([type=hidden])")
+        cnt = await loc.count()
+        log_to_file(f"  count={cnt}")
+        if cnt > 0:
+            el = loc.first
+            await el.scroll_into_view_if_needed()
             try:
-                await loc.click(force=True, timeout=5000)
+                await el.click(timeout=3000)
             except Exception:
-                pass
-            await loc.fill("", force=True)
-            await loc.press_sequentially(username, delay=60)
-            await loc.press("Tab")
-            val = await loc.input_value()
+                await el.click(force=True)
+            await el.fill("")
+            await el.press_sequentially(username, delay=50)
+            await el.press("Tab")
+            await page.wait_for_timeout(300)
+            val = await el.input_value()
+            log_to_file(f"  after fill: value='{val}'")
             if val == username:
-                log.info("Username filled via press_sequentially")
+                log_to_file("  SUCCESS generic")
                 return True
     except Exception as e:
-        log.warning("press_sequentially failed: %s", e)
+        log_to_file(f"  FAILED generic: {e}", "ERROR")
 
+    log_to_file(f"ALL FAILED for {username}", "ERROR")
     return False
 
 
@@ -332,31 +466,31 @@ async def fill_password(page, password):
                 pwd.dispatchEvent(new Event('change', {bubbles: true}));
                 pwd.dispatchEvent(new Event('blur', {bubbles: true}));
                 pwd.dispatchEvent(new Event('keyup', {bubbles: true}));
-                return true;
+                return pwd.value === val;
             }
         """, password)
         if ok:
-            check = await page.evaluate(
-                "() => document.querySelector('input[type=password]').value"
-            )
-            if check == password:
-                log.info("Password filled via JS")
-                return True
+            log_to_file("Password filled via JS")
+            return True
     except Exception:
         pass
 
     try:
         loc = page.locator("input[type=password]").first
         if await loc.count() > 0:
-            await loc.fill("", force=True)
-            await loc.press_sequentially(password, delay=60)
+            try:
+                await loc.click(timeout=3000)
+            except Exception:
+                await loc.click(force=True)
+            await loc.fill("")
+            await loc.press_sequentially(password, delay=50)
             await loc.press("Tab")
             val = await loc.input_value()
             if val == password:
-                log.info("Password filled via press_sequentially")
+                log_to_file("Password filled via press_sequentially")
                 return True
     except Exception as e:
-        log.warning("press_sequentially pwd failed: %s", e)
+        log_to_file(f"password fill failed: {e}", "ERROR")
 
     return False
 
@@ -440,7 +574,7 @@ async def wait_for_result(page, timeout=45):
 
     while time.time() - start < timeout:
         if page.url != last_url:
-            log.info("URL changed: %s -> %s", last_url, page.url)
+            log_to_file(f"URL changed: {last_url} -> {page.url}")
             if "/sign-in" not in page.url and "/login" not in page.url:
                 return {"status": "success", "url": page.url}
             last_url = page.url
@@ -475,18 +609,18 @@ async def try_account(browser, user, pwd, bot, chat_id):
     page = await ctx.new_page()
 
     try:
-        log.info("Opening %s", SIGNIN_URL)
+        log_to_file(f"Opening {SIGNIN_URL} for {user}")
         await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
 
         ready = await wait_page_ready(page, timeout=30)
         if not ready:
-            log.warning("Page not ready after 30s")
+            log_to_file("Page not ready after 30s", "ERROR")
             await page.screenshot(path="/tmp/page_not_ready.png", full_page=True)
             try:
                 with open("/tmp/page_not_ready.png", "rb") as f:
                     await bot.send_photo(
                         chat_id=chat_id, photo=f,
-                        caption=f"⏰ الصفحة ما تحملتش (بلا حقول): {user}",
+                        caption=f"⏰ الصفحة ما تحملتش: {user}",
                     )
             except Exception:
                 pass
@@ -497,7 +631,9 @@ async def try_account(browser, user, pwd, bot, chat_id):
         await page.wait_for_timeout(300)
 
         if not await fill_username(page, user):
-            log.error("Fill username FAILED")
+            log_to_file(f"FAIL fill_username for {user}", "ERROR")
+
+            # 📸 صورة
             await page.screenshot(path="/tmp/fill_username_fail.png", full_page=True)
             try:
                 with open("/tmp/fill_username_fail.png", "rb") as f:
@@ -507,13 +643,39 @@ async def try_account(browser, user, pwd, bot, chat_id):
                     )
             except Exception:
                 pass
+
+            # 📄 HTML
+            try:
+                html = await page.content()
+                with open("/tmp/page_dump.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+                with open("/tmp/page_dump.html", "rb") as f:
+                    await bot.send_document(
+                        chat_id=chat_id, document=f,
+                        filename=f"page_dump_{user}.html",
+                        caption="📄 HTML الصفحة",
+                    )
+            except Exception as e:
+                log_to_file(f"html dump failed: {e}", "ERROR")
+
+            # 📄 Logs
+            try:
+                with open(LOG_FILE, "rb") as f:
+                    await bot.send_document(
+                        chat_id=chat_id, document=f,
+                        filename="bot.log",
+                        caption="📋 Logs البوت",
+                    )
+            except Exception as e:
+                log_to_file(f"log dump failed: {e}", "ERROR")
+
             await ctx.close()
             return {"status": "error", "msg": "fill_username failed", "stop": True}
 
         await page.wait_for_timeout(200)
 
         if not await fill_password(page, pwd):
-            log.error("Fill password FAILED")
+            log_to_file(f"FAIL fill_password for {user}", "ERROR")
             await page.screenshot(path="/tmp/fill_pwd_fail.png", full_page=True)
             try:
                 with open("/tmp/fill_pwd_fail.png", "rb") as f:
@@ -523,13 +685,22 @@ async def try_account(browser, user, pwd, bot, chat_id):
                     )
             except Exception:
                 pass
+            try:
+                with open(LOG_FILE, "rb") as f:
+                    await bot.send_document(
+                        chat_id=chat_id, document=f,
+                        filename="bot.log",
+                        caption="📋 Logs",
+                    )
+            except Exception:
+                pass
             await ctx.close()
             return {"status": "error", "msg": "fill_password failed", "stop": True}
 
         await page.wait_for_timeout(300)
 
         if not await click_connexion(page):
-            log.error("Connexion button not found")
+            log_to_file("Connexion button not found", "ERROR")
             await page.screenshot(path="/tmp/no_btn.png", full_page=False)
             try:
                 with open("/tmp/no_btn.png", "rb") as f:
@@ -542,10 +713,10 @@ async def try_account(browser, user, pwd, bot, chat_id):
             await ctx.close()
             return {"status": "error", "msg": "no connexion button", "stop": True}
 
-        log.info("Clicked Connexion, waiting for result...")
+        log_to_file("Clicked Connexion, waiting...")
 
         result = await wait_for_result(page, timeout=45)
-        log.info("Result: %s", result)
+        log_to_file(f"Result: {result}")
 
         await page.screenshot(path="/tmp/after_submit.png", full_page=False)
 
@@ -553,12 +724,13 @@ async def try_account(browser, user, pwd, bot, chat_id):
             await page.wait_for_timeout(2000)
             body = await page.inner_text("body")
             bal = find_balance_in_text(body)
+            log_to_file(f"Success! balance={bal}")
             await ctx.close()
             return {"status": "success", "balance": bal}
 
         if result["status"] == "error":
             err = result["error"]
-            log.info("Error detected: %s", err)
+            log_to_file(f"Error: {err}")
 
             try:
                 with open("/tmp/after_submit.png", "rb") as f:
@@ -567,8 +739,7 @@ async def try_account(browser, user, pwd, bot, chat_id):
                         caption=(
                             f"🛑 <b>خطأ!</b>\n"
                             f"الحساب: <code>{user}</code>\n"
-                            f"الخطأ: <code>{err}</code>\n\n"
-                            f"⏸️ البوت توقف."
+                            f"الخطأ: <code>{err}</code>"
                         ),
                         parse_mode="HTML",
                     )
@@ -582,7 +753,7 @@ async def try_account(browser, user, pwd, bot, chat_id):
             await ctx.close()
             return {"status": "error", "msg": err, "stop": True}
 
-        log.warning("Timeout waiting for result")
+        log_to_file("Timeout after submit", "WARN")
         try:
             with open("/tmp/after_submit.png", "rb") as f:
                 await bot.send_photo(
@@ -595,7 +766,7 @@ async def try_account(browser, user, pwd, bot, chat_id):
         return {"status": "error", "msg": "timeout after submit", "stop": True}
 
     except Exception as e:
-        log.exception("try_account error")
+        log_to_file(f"try_account exception: {e}", "ERROR")
         try:
             await ctx.close()
         except Exception:
@@ -611,6 +782,8 @@ async def run_check(app, chat_id, accounts):
     stats.total = len(accounts)
     state["stats"] = stats
     bot = app.bot
+
+    log_to_file(f"=== Starting check with {len(accounts)} accounts ===")
 
     await bot.send_message(
         chat_id=chat_id,
@@ -643,8 +816,8 @@ async def run_check(app, chat_id, accounts):
 
                     try:
                         r = await try_account(browser, user, pwd, bot, chat_id)
-                    except Exception:
-                        log.exception("account failed")
+                    except Exception as e:
+                        log_to_file(f"account failed: {e}", "ERROR")
                         r = {"status": "error", "msg": "exception", "stop": True}
 
                     if r.get("stop"):
@@ -727,7 +900,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🚀 <b>بوت Ooredoo Railway</b>\n\n"
         "ابعتلي ملف <code>accounts.txt</code>:\n"
         "<code>0553372434:password</code>\n\n"
-        "/start /status /stop",
+        "/start /status /stop /log",
         parse_mode="HTML",
     )
 
@@ -743,6 +916,19 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text("✅ جاهز. ابعتلي ملف.")
+
+
+async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """يرسل ملف الـ logs"""
+    try:
+        with open(LOG_FILE, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename="bot.log",
+                caption="📋 Logs",
+            )
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -809,6 +995,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 def main():
     print("🚀 Ooredoo Railway Bot starting...")
+    log_to_file("Bot starting")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise Exception("TELEGRAM_TOKEN أو TELEGRAM_CHAT_ID ناقصين")
 
@@ -829,12 +1016,13 @@ def main():
     )
 
     async def on_error(update, context):
-        log.error("Handler error: %s", context.error)
+        log_to_file(f"Handler error: {context.error}", "ERROR")
 
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("log", cmd_log))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
