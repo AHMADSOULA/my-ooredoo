@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Ooredoo Railway Bot
-- Playwright browser
-- Telegram interface
-- Waits for page load, then fills, then submits
+- Playwright browser + Telegram
+- Waits for fields (not spinner)
 - On error → stops and sends screenshot
 """
 
@@ -149,51 +148,43 @@ def is_invalid_creds(text):
 
 
 # ============================================================
-#  🖼️ كشف الصفحة الجاهزة (ماشي spinner)
+#  ⏳ انتظار الصفحة — بالحقول فقط
 # ============================================================
 async def wait_page_ready(page, timeout=30):
     """
-    نستنو الصفحة تكون جاهزة:
-    - ما كاينش spinner
-    - كاين input fields
+    نستنو الحقول تظهر (نتجاهلو الـ spinner)
     """
     start = time.time()
+    last_log = 0
+
     while time.time() - start < timeout:
         try:
-            # نتحققو إذا كاين spinner
-            spinner = await page.evaluate("""
-                () => {
-                    const s = document.querySelector(
-                        '.preloader-back, .preloader-floating-circles, ' +
-                        '.v-overlay--active .v-progress-circular, ' +
-                        '.v-progress-circular--indeterminate'
-                    );
-                    if (!s) return false;
-                    const st = getComputedStyle(s);
-                    return st.display !== 'none' && st.visibility !== 'hidden';
-                }
-            """)
-            if spinner:
-                await asyncio.sleep(0.5)
-                continue
-
-            # نتحققو من وجود الحقول
-            has_inputs = await page.evaluate("""
+            has_fields = await page.evaluate("""
                 () => {
                     const pwd = document.querySelector('input[type=password]');
                     const txt = [...document.querySelectorAll('input')].filter(i => {
                         const t = i.type || 'text';
                         return t !== 'password' && t !== 'hidden' && i.offsetParent !== null;
                     });
-                    return !!(pwd && txt.length > 0);
+                    const pwdVisible = pwd && pwd.offsetParent !== null;
+                    return {
+                        has_password: !!pwdVisible,
+                        has_text: txt.length > 0,
+                    };
                 }
             """)
-            if has_inputs:
-                log.info("Page ready (inputs visible)")
+
+            if has_fields.get("has_password") and has_fields.get("has_text"):
+                log.info("Page ready (fields visible)")
                 return True
 
-        except Exception:
-            pass
+            if time.time() - last_log > 5:
+                log.info("Waiting for fields: %s", has_fields)
+                last_log = time.time()
+
+        except Exception as e:
+            log.warning("wait_page_ready check failed: %s", e)
+
         await asyncio.sleep(0.3)
 
     log.warning("wait_page_ready timeout")
@@ -387,12 +378,9 @@ async def click_connexion(page):
 
 
 async def detect_red_error(page):
-    """يكتشف الخطأ الأحمر في الصفحة"""
     try:
-        # 1) نبحث في الأخطاء الظاهرة
         err = await page.evaluate("""
             () => {
-                // رسائل v-messages
                 const vmsgs = [...document.querySelectorAll(
                     '.v-messages__message, .v-input__details .v-messages'
                 )];
@@ -405,7 +393,6 @@ async def detect_red_error(page):
                         }
                     }
                 }
-                // رسائل toast
                 const toasts = [...document.querySelectorAll(
                     '.Vue-Toastification__toast, .v-snackbar, .v-alert'
                 )];
@@ -426,7 +413,6 @@ async def detect_red_error(page):
     except Exception:
         pass
 
-    # 2) نبحث في نص الصفحة
     try:
         body = await page.inner_text("body")
     except Exception:
@@ -440,8 +426,6 @@ async def detect_red_error(page):
         r"(عذرا[^\n]{0,120}معاودة[^\n]{0,120})",
         r"(يرجى معاودة[^\n]{0,120})",
         r"(veuillez\s+réessayer[^\n]{0,120})",
-        r"(erreur[^\n]{0,120})",
-        r"(خطأ[^\n]{0,120})",
     ]
     for p in pats:
         m = re.search(p, body, re.IGNORECASE)
@@ -451,29 +435,20 @@ async def detect_red_error(page):
 
 
 async def wait_for_result(page, timeout=45):
-    """
-    نستنو النتيجة:
-    - URL يتغير (دخلنا)
-    - خطأ أحمر يظهر
-    - timeout
-    """
     start = time.time()
     last_url = page.url
 
     while time.time() - start < timeout:
-        # 1) URL تغير؟
         if page.url != last_url:
             log.info("URL changed: %s -> %s", last_url, page.url)
             if "/sign-in" not in page.url and "/login" not in page.url:
                 return {"status": "success", "url": page.url}
             last_url = page.url
 
-        # 2) كاين خطأ؟
         err = await detect_red_error(page)
         if err:
             return {"status": "error", "error": err}
 
-        # 3) نتحققو من أننا دخلنا (URL + ما كاينش password input)
         if "/sign-in" not in page.url and "/login" not in page.url:
             try:
                 has_pwd = await page.locator("input[type=password]").count()
@@ -485,16 +460,6 @@ async def wait_for_result(page, timeout=45):
         await asyncio.sleep(0.5)
 
     return {"status": "timeout"}
-
-
-async def is_logged_in(page):
-    try:
-        if "/sign-in" in page.url or "/login" in page.url:
-            if await page.locator("input[type='password']").count() > 0:
-                return False
-        return True
-    except Exception:
-        return False
 
 
 # ============================================================
@@ -510,11 +475,9 @@ async def try_account(browser, user, pwd, bot, chat_id):
     page = await ctx.new_page()
 
     try:
-        # 1) نفتحو الصفحة
         log.info("Opening %s", SIGNIN_URL)
         await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
 
-        # 2) نستنو الصفحة تكون جاهزة
         ready = await wait_page_ready(page, timeout=30)
         if not ready:
             log.warning("Page not ready after 30s")
@@ -523,7 +486,7 @@ async def try_account(browser, user, pwd, bot, chat_id):
                 with open("/tmp/page_not_ready.png", "rb") as f:
                     await bot.send_photo(
                         chat_id=chat_id, photo=f,
-                        caption=f"⏰ الصفحة ما تحملتش على 30 ثانية\n{user}",
+                        caption=f"⏰ الصفحة ما تحملتش (بلا حقول): {user}",
                     )
             except Exception:
                 pass
@@ -533,7 +496,6 @@ async def try_account(browser, user, pwd, bot, chat_id):
         await hide_overlays(page)
         await page.wait_for_timeout(300)
 
-        # 3) نعبّيو الحقول
         if not await fill_username(page, user):
             log.error("Fill username FAILED")
             await page.screenshot(path="/tmp/fill_username_fail.png", full_page=True)
@@ -566,10 +528,6 @@ async def try_account(browser, user, pwd, bot, chat_id):
 
         await page.wait_for_timeout(300)
 
-        # 4) نصوّرو قبل الضغط
-        await page.screenshot(path="/tmp/before_click.png", full_page=False)
-
-        # 5) نضغطو Connexion
         if not await click_connexion(page):
             log.error("Connexion button not found")
             await page.screenshot(path="/tmp/no_btn.png", full_page=False)
@@ -586,15 +544,12 @@ async def try_account(browser, user, pwd, bot, chat_id):
 
         log.info("Clicked Connexion, waiting for result...")
 
-        # 6) نستنو النتيجة
         result = await wait_for_result(page, timeout=45)
         log.info("Result: %s", result)
 
-        # 7) نصوّرو
         await page.screenshot(path="/tmp/after_submit.png", full_page=False)
 
         if result["status"] == "success":
-            # دخلنا — نجيبو الرصيد
             await page.wait_for_timeout(2000)
             body = await page.inner_text("body")
             bal = find_balance_in_text(body)
@@ -605,7 +560,6 @@ async def try_account(browser, user, pwd, bot, chat_id):
             err = result["error"]
             log.info("Error detected: %s", err)
 
-            # نبعتو صورة الخطأ للمستخدم
             try:
                 with open("/tmp/after_submit.png", "rb") as f:
                     await bot.send_photo(
@@ -621,16 +575,13 @@ async def try_account(browser, user, pwd, bot, chat_id):
             except Exception:
                 pass
 
-            # إذا invalid → نتخطى الحساب
             if is_invalid_creds(err):
                 await ctx.close()
                 return {"status": "invalid", "msg": err}
 
-            # خطأ آخر → نوقف البوت
             await ctx.close()
             return {"status": "error", "msg": err, "stop": True}
 
-        # timeout
         log.warning("Timeout waiting for result")
         try:
             with open("/tmp/after_submit.png", "rb") as f:
@@ -697,7 +648,6 @@ async def run_check(app, chat_id, accounts):
                         r = {"status": "error", "msg": "exception", "stop": True}
 
                     if r.get("stop"):
-                        # 🛑 نوقف البوت
                         stats.errors += 1
                         stats.done += 1
                         await bot.send_message(
