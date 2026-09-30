@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ooredoo Bot with reCAPTCHA injection
+Ooredoo Bot - headful mode + stronger reCAPTCHA
 """
 
 import os
@@ -24,7 +24,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 MIN_BALANCE = int(os.getenv("MIN_BALANCE", "100"))
-HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+HEADLESS = False  # ✅ headful باش reCAPTCHA يخدم
 RETRY_DELAY = 3
 
 HOME_URL = "https://my.ooredoo.dz/"
@@ -156,10 +156,9 @@ def is_invalid_creds(text):
 
 
 # ============================================================
-#  🧩 reCAPTCHA Enterprise Injection
+#  🧩 reCAPTCHA Enterprise
 # ============================================================
 async def inject_recaptcha_token(page):
-    """يحل reCAPTCHA Enterprise Invisible قبل الضغط"""
     try:
         log_to_file("inject_recaptcha: starting")
 
@@ -178,7 +177,6 @@ async def inject_recaptcha_token(page):
         log_to_file(f"site_key: {site_key}")
 
         if not site_key:
-            log_to_file("no site_key", "WARN")
             return False
 
         # نستنو grecaptcha
@@ -192,40 +190,55 @@ async def inject_recaptcha_token(page):
 
         log_to_file("grecaptcha loaded")
 
-        # نستدعيو execute
+        # نحاكيو المستخدم
+        try:
+            await page.mouse.move(200, 300)
+            await page.wait_for_timeout(200)
+            await page.mouse.move(250, 400)
+            await page.wait_for_timeout(200)
+            await page.mouse.click(300, 500)
+            await page.wait_for_timeout(500)
+        except Exception:
+            pass
+
         token = await page.evaluate("""
             async (siteKey) => {
                 return new Promise((resolve) => {
                     try {
+                        if (!window.grecaptcha || !window.grecaptcha.enterprise) {
+                            resolve('NO_GRECAPTCHA');
+                            return;
+                        }
+                        const timeout = setTimeout(() => resolve('TIMEOUT'), 45000);
                         window.grecaptcha.enterprise.ready(async () => {
                             try {
                                 const t = await window.grecaptcha.enterprise.execute(
-                                    siteKey,
-                                    {action: 'login'}
+                                    siteKey, {action: 'login'}
                                 );
+                                clearTimeout(timeout);
                                 resolve(t);
                             } catch (e) {
+                                clearTimeout(timeout);
                                 resolve('ERR:' + e.message);
                             }
                         });
                     } catch (e) {
                         resolve('ERR:' + e.message);
                     }
-                    setTimeout(() => resolve('TIMEOUT'), 30000);
                 });
             }
         """, site_key)
 
-        log_to_file(f"recaptcha token: {str(token)[:50]}")
+        log_to_file(f"recaptcha token: {str(token)[:60]}")
 
-        if not token or str(token).startswith("ERR") or token == "TIMEOUT":
+        if not token or str(token).startswith("ERR") or token in ("TIMEOUT", "NO_GRECAPTCHA"):
             log_to_file(f"token failed: {token}", "ERROR")
             return False
 
         await page.evaluate("""
             (t) => {
                 let ta = document.querySelector(
-                    "textarea[name='g-recaptcha-response']"
+                    "textarea[name='g-recaptcha-response'], #g-recaptcha-response"
                 );
                 if (!ta) {
                     ta = document.createElement('textarea');
@@ -238,7 +251,17 @@ async def inject_recaptcha_token(page):
                 ta.textContent = t;
                 ta.dispatchEvent(new Event('input',  {bubbles: true}));
                 ta.dispatchEvent(new Event('change', {bubbles: true}));
-                return ta.value === t;
+
+                if (window.___grecaptcha_cfg) {
+                    const clients = window.___grecaptcha_cfg.clients || {};
+                    for (const id in clients) {
+                        const c = clients[id];
+                        if (c && c.callback) {
+                            try { c.callback(t); } catch(e) {}
+                        }
+                    }
+                }
+                return true;
             }
         """, token)
 
@@ -261,7 +284,11 @@ async def run_otp_flow(app, chat_id, phone):
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ])
         ctx = await browser.new_context(
             locale="fr-FR",
             viewport={"width": 412, "height": 915},
@@ -288,7 +315,7 @@ async def run_otp_flow(app, chat_id, phone):
                 await bot.send_photo(chat_id=chat_id, photo=f,
                     caption="📸 الصفحة", parse_mode="HTML")
 
-            # ✅ كتابة الرقم بـ fill()
+            # كتابة الرقم
             try:
                 loc = page.locator("input[aria-label='Ooredoo mobile number']").first
                 if await loc.count() == 0:
@@ -306,18 +333,16 @@ async def run_otp_flow(app, chat_id, phone):
                     await page.wait_for_timeout(500)
                     val = await loc.input_value()
                     log_to_file(f"fill() value: '{val}'")
-                    if val != phone:
-                        log_to_file("fill failed", "ERROR")
             except Exception as e:
                 log_to_file(f"fill error: {e}", "ERROR")
 
             await page.screenshot(path="/tmp/otp_step2.png", full_page=True)
             with open("/tmp/otp_step2.png", "rb") as f:
                 await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption=f"📸 بعد كتابة <code>{phone}</code>",
+                    caption=f"📸 بعد <code>{phone}</code>",
                     parse_mode="HTML")
 
-            # ✅ نحلو reCAPTCHA قبل الضغط
+            # reCAPTCHA
             await bot.send_message(chat_id=chat_id,
                 text="🧩 نحل reCAPTCHA...", parse_mode="HTML")
             rc_ok = await inject_recaptcha_token(page)
@@ -326,11 +351,11 @@ async def run_otp_flow(app, chat_id, phone):
                     text="✅ reCAPTCHA جاهز", parse_mode="HTML")
             else:
                 await bot.send_message(chat_id=chat_id,
-                    text="⚠️ reCAPTCHA فشل — نكمل", parse_mode="HTML")
+                    text="⚠️ reCAPTCHA فشل", parse_mode="HTML")
 
             await page.wait_for_timeout(500)
 
-            # نضغطو الزر
+            # نضغطو
             old_url = page.url
             clicked = False
             try:
@@ -339,9 +364,8 @@ async def run_otp_flow(app, chat_id, phone):
                 if await btn.count() > 0:
                     await btn.first.click(timeout=5000)
                     clicked = True
-                    log_to_file("Clicked via role")
-            except Exception as e:
-                log_to_file(f"click role: {e}", "WARN")
+            except Exception:
+                pass
 
             if not clicked:
                 try:
@@ -356,24 +380,12 @@ async def run_otp_flow(app, chat_id, phone):
                             return true;
                         }
                     """))
-                    log_to_file(f"Clicked JS: {clicked}")
                 except Exception:
                     pass
-
-            if not clicked:
-                await bot.send_message(chat_id=chat_id, text="❌ ما لقيناش زر")
-                try:
-                    with open(LOG_FILE, "rb") as f:
-                        await bot.send_document(chat_id=chat_id, document=f,
-                            filename="bot.log", caption="📋 Logs")
-                except Exception:
-                    pass
-                await browser.close()
-                return
 
             # نستنو
             await bot.send_message(chat_id=chat_id,
-                text="⏳ <b>نستنو الصفحة تتبدل...</b> (60s)",
+                text="⏳ <b>نستنو...</b> (60s)",
                 parse_mode="HTML")
 
             page_changed = False
@@ -381,10 +393,8 @@ async def run_otp_flow(app, chat_id, phone):
             start_wait = time.time()
 
             while time.time() - start_wait < 60:
-                current_url = page.url
-                if current_url != old_url:
-                    log_to_file(f"URL {old_url} → {current_url}")
-                    old_url = current_url
+                if page.url != old_url:
+                    old_url = page.url
                     page_changed = True
 
                 try:
@@ -411,47 +421,20 @@ async def run_otp_flow(app, chat_id, phone):
 
                 await asyncio.sleep(1)
 
-            if page_changed or otp_field_visible:
-                await bot.send_message(chat_id=chat_id,
-                    text=(f"✅ <b>الصفحة تبدلت!</b>\nURL: <code>{page.url}</code>"),
-                    parse_mode="HTML")
-            else:
-                await bot.send_message(chat_id=chat_id,
-                    text="⏰ <b>الصفحة ما تبدلتش</b>\n📄 نبعثلك التشخيص...",
-                    parse_mode="HTML")
-
-                try:
-                    html = await page.content()
-                    with open("/tmp/otp_fail.html", "w", encoding="utf-8") as f:
-                        f.write(html)
-                except Exception:
-                    pass
-
-                try:
-                    await page.screenshot(path="/tmp/otp_fail.png", full_page=True)
-                except Exception:
-                    pass
-
-                try:
-                    with open(LOG_FILE, "rb") as f:
-                        await bot.send_document(chat_id=chat_id, document=f,
-                            filename="bot.log", caption="📋 Logs")
-                except Exception:
-                    pass
-
-                try:
-                    with open("/tmp/otp_fail.html", "rb") as f:
-                        await bot.send_document(chat_id=chat_id, document=f,
-                            filename="otp_fail.html", caption="📄 HTML")
-                except Exception:
-                    pass
-
             await page.wait_for_timeout(2000)
 
             await page.screenshot(path="/tmp/otp_step3.png", full_page=True)
             with open("/tmp/otp_step3.png", "rb") as f:
                 await bot.send_photo(chat_id=chat_id, photo=f,
                     caption="📸 الصفحة الحالية", parse_mode="HTML")
+
+            if page_changed or otp_field_visible:
+                await bot.send_message(chat_id=chat_id,
+                    text=f"✅ <b>الصفحة تبدلت!</b>\n<code>{page.url}</code>",
+                    parse_mode="HTML")
+            else:
+                await bot.send_message(chat_id=chat_id,
+                    text="⏰ ما تبدلتش", parse_mode="HTML")
 
             # نطلب OTP
             loop = asyncio.get_event_loop()
@@ -461,7 +444,7 @@ async def run_otp_flow(app, chat_id, phone):
             state["otp_chat"] = chat_id
 
             await bot.send_message(chat_id=chat_id,
-                text="🔐 <b>ابعتلي رمز OTP</b> (SMS)",
+                text="🔐 <b>ابعتلي رمز OTP</b>",
                 parse_mode="HTML")
 
             try:
@@ -502,8 +485,7 @@ async def run_otp_flow(app, chat_id, phone):
             await page.screenshot(path="/tmp/otp_step4.png", full_page=True)
             with open("/tmp/otp_step4.png", "rb") as f:
                 await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption=f"📸 بعد كتابة <code>{otp_code}</code>",
-                    parse_mode="HTML")
+                    caption=f"📸 بعد الرمز", parse_mode="HTML")
 
             # نضغطو زر التحقق
             try:
@@ -537,7 +519,7 @@ async def run_otp_flow(app, chat_id, phone):
             await page.screenshot(path="/tmp/otp_final.png", full_page=True)
             with open("/tmp/otp_final.png", "rb") as f:
                 await bot.send_photo(chat_id=chat_id, photo=f,
-                    caption="📸 الصفحة النهائية", parse_mode="HTML")
+                    caption="📸 النهائية", parse_mode="HTML")
 
             try:
                 body = await page.inner_text("body")
@@ -553,7 +535,7 @@ async def run_otp_flow(app, chat_id, phone):
                     parse_mode="HTML")
             else:
                 await bot.send_message(chat_id=chat_id,
-                    text="⚠️ دخلنا لكن ما لقيناش الرصيد",
+                    text="⚠️ ما لقيناش الرصيد",
                     parse_mode="HTML")
 
         except Exception as e:
@@ -574,7 +556,7 @@ async def run_otp_flow(app, chat_id, phone):
 
 
 # ============================================================
-#  Username Flow (كما هو من قبل)
+#  Username Flow (كما هو)
 # ============================================================
 async def wait_page_ready(page, timeout=30):
     start = time.time()
@@ -831,12 +813,13 @@ async def run_check(app, chat_id, accounts):
     bot = app.bot
 
     await bot.send_message(chat_id=chat_id,
-        text=f"🚀 <b>بداية</b>\nعدد: <b>{len(accounts)}</b>\n♻️ يتخطى أي خطأ",
+        text=f"🚀 <b>بداية</b>\nعدد: <b>{len(accounts)}</b>",
         parse_mode="HTML")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled"])
         try:
             for idx, (user, pwd) in enumerate(accounts, 1):
                 if state["stop"]:
@@ -908,8 +891,8 @@ async def run_check(app, chat_id, accounts):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 بوت Ooredoo\n\n"
-        "📁 ملف accounts.txt → فحص عادي\n"
-        "📱 رقم فقط → OTP\n\n"
+        "📁 ملف → فحص\n"
+        "📱 رقم → OTP\n\n"
         "/start /status /stop /log",
         parse_mode="HTML")
 
@@ -960,8 +943,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     state["running"] = True
     state["stop"] = False
-    await update.message.reply_text(
-        f"📄 {len(accounts)} حساب.", parse_mode="HTML")
+    await update.message.reply_text(f"📄 {len(accounts)} حساب.", parse_mode="HTML")
     asyncio.create_task(run_check(ctx.application, update.effective_chat.id, accounts))
 
 
@@ -999,8 +981,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "💡 ابعتلي:\n• ملف <code>accounts.txt</code>\n• رقم (0553372434)",
-        parse_mode="HTML")
+        "💡 ابعتلي ملف أو رقم.", parse_mode="HTML")
 
 
 def main():
